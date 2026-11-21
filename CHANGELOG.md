@@ -1,5 +1,21 @@
 # Changelog
 
+## 1.3.0 — 2026-11-21
+
+- Fix: PasarGuard setup assumed the WireGuard interface was `wg0`. With a panel core named
+  `wg1` (or anything else) the IPv6 rule was bound to a missing interface and clients had no
+  IPv6. The interface is now detected (the node's own `iif X lookup TABLE` rule, else the only
+  WireGuard interface, else a question) and its addresses are offered as the client subnets.
+  The node's current routing table from `.env` is kept.
+- Setup warns before applying when the chosen interface is missing while others exist, or when
+  the interface's networks are not in the subnets entered (default answer then: no).
+- `pg verify` and `doctor`: a missing interface is an error that names the right one and the fix.
+- New `gretun tunnel edit`: change MTU, either public address, tunnel network or role of a
+  tunnel (prints the matching command for the other server; rollback timer as usual).
+- New `gretun pg edit`: change WireGuard interface, client subnets, routing table or tunnel of
+  a node setup. New `gretun exit edit`: change client subnets and WAN interfaces of an exit.
+  All three also in the menu, as an editor that applies nothing until "Apply".
+
 ## 1.2.6 — 2026-11-21
 
 - Fix: the heal timer replaced gretun's nft tables every minute although nothing had

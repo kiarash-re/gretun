@@ -124,6 +124,7 @@ gretun
 | | Remove | Refuses if PasarGuard, an exit or forwarder rules still use the tunnel |
 | | Import | Hand-made `gre1`, or haproxy-forwarder |
 | | Alerts | ntfy URL for tunnel down/up messages |
+| | Edit | MTU, either server's address, tunnel network, role; prints the matching command for the other server |
 | **2) IPv6 forwarder** | Add ports | Destination IPv6 (or a tunnel's inner IP), ports, TCP/UDP, PROXY v2, health check |
 | | List / Remove | Shows or removes rules |
 | | Status | Services, listening ports, connections, traffic, whether the destination is reachable |
@@ -137,6 +138,8 @@ gretun
 | | Panel settings | What you still have to set in the panel |
 | | Show exit key | Prints the exit key again |
 | | Undo node / remove exit | Puts the old values back |
+| | Edit node setup | WireGuard interface, client subnets, routing table, tunnel (same checks and rollback as setup) |
+| | Edit exit | Client subnets, WAN interface(s) |
 | **4) Status** | | Everything at a glance |
 | **5) Doctor** | | Offloads, MTUs, rules, tables, NAT, pings, units, with plain-English hints |
 | **6) Tools** | | Speed test, tuning, confirm/rollback, repair, update, uninstall |
@@ -169,6 +172,13 @@ gretun tunnel key gre1
 ```bash
 gretun tunnel remove gre2
 ```
+```bash
+gretun tunnel edit gre1 --mtu 1420
+```
+
+`tunnel edit` without options opens an editor for MTU, this server's and the other server's
+public address, the tunnel network and the role. Address, MTU and network changes must be made
+on both servers; gretun prints the command for the other side.
 
 Section 2:
 
@@ -202,13 +212,24 @@ gretun exit add --key 'gretun-exit://...'
 ```bash
 gretun pg status
 ```
+```bash
+gretun pg edit node-ir-miz02 --wg-if wg1
+```
+```bash
+gretun exit edit gre1 --v6 fd10:10::/64
+```
+
+The WireGuard interface is detected: the interface in the node's own `iif X lookup TABLE` rule,
+otherwise the only WireGuard interface (a question when there are several). Its addresses become
+the default client subnets. If the configured interface does not exist, `pg verify` and `doctor`
+name the right one and the fix (`gretun pg edit --wg-if ...`).
 
 Advanced settings (the menu offers the same, the defaults are automatic):
 
 | Flag | Meaning | Default |
 |---|---|---|
-| `--table N` | Routing table (`PG_NODE_WG_ROUTE_TABLE`) | First free table in 1470–1499 |
-| `--wg-if NAME` | WireGuard interface of the node | `wg0` |
+| `--table N` | Routing table (`PG_NODE_WG_ROUTE_TABLE`) | The node's current table, else the first free one in 1470–1499 |
+| `--wg-if NAME` | WireGuard interface of the node (the panel core's `interface_name`) | Detected |
 | `--node NAME` / `--node-dir DIR` | Which node | Detected |
 | `--tunnel NAME` | Which tunnel | The only Iran-side tunnel |
 | `--wan IFACE` | WAN interface on the foreign server (`exit add`) | Interface of the default route |
@@ -475,6 +496,7 @@ gretun tunnel import manual --if gre1 --role iran
   - حذف تونل
   - import
   - هشدار ntfy
+  - ویرایش تونل: MTU، آدرس هر دو سرور، شبکه‌ی داخل تونل، نقش سرور. دستور هم‌سانِ سرور مقابل را هم نشان می‌دهد.
 - **۲) فوروارد IPv6**
   - افزودن پورت
   - لیست و حذف
@@ -490,6 +512,9 @@ gretun tunnel import manual --if gre1 --role iran
   - تنظیمات لازم در پنل
   - نمایش دوباره‌ی کلید exit
   - برگرداندن تنظیمات نود / حذف exit
+  - ویرایش تنظیمات نود: اینترفیس WireGuard، رنج‌های کلاینت، جدول routing، تونل (`gretun pg edit`)
+  - ویرایش exit: رنج‌های کلاینت، اینترفیس WAN (`gretun exit edit`)
+  - اینترفیس WireGuard نود خودکار تشخیص داده می‌شود (مثلاً `wg1` اگر هسته‌ی پنل این نام را دارد) و آدرس‌هایش پیش‌فرض رنج‌ها می‌شوند.
 - **۴) وضعیت کلی**
 - **۵) Doctor:** پیدا کردن مشکل‌ها با راهنمایی ساده
 - **۶) ابزارها:** تست سرعت، tuning، تأیید یا برگشت تغییر، تعمیر، به‌روزرسانی، حذف

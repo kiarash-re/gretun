@@ -26,7 +26,7 @@
 set -Eeuo pipefail
 shopt -s nullglob
 
-readonly VERSION="1.2.6"
+readonly VERSION="1.3.0"
 readonly MARK="# Managed by gretun"
 
 # GRETUN_ROOT prefixes every path and switches off systemd/udev calls. It is
@@ -1655,6 +1655,113 @@ cmd_tunnel_key() {
     print_key "$n"
 }
 
+addr_arg() {  # addr_arg FAMILY VALUE FLAG: prints the checked address
+    if [[ "$1" == 4 ]] && is_ipv4 "$2"; then printf '%s' "$2"; return 0; fi
+    if [[ "$1" == 6 ]] && is_ipv6 "$2"; then compress6 "$2"; return 0; fi
+    die "$3 must be an IPv$1 address (the tunnel uses IPv$1): $2"
+}
+# tunnel edit: MTU, public addresses, inner network, role. Values not changed
+# stay as they are; the interface is recreated only when an address changes.
+cmd_tunnel_edit() {
+    local n="${ARGS[0]:-$O_NAME}" fam role mtu loc rem net c a f used
+    if [[ -z "$n" ]]; then pick_tunnel n; fi
+    tun_load "$n" || die "Unknown tunnel: $n"
+    fam="${C[FAMILY]}" role="${C[ROLE]}" mtu="${C[MTU]}" loc="${C[LOCAL]}" rem="${C[REMOTE]}"
+    net=$(cidr_norm "${C[IN4_LOCAL]}/${C[IN4_PREFIX]:-30}")
+    local o_role="$role" o_mtu="$mtu" o_loc="$loc" o_rem="$rem" o_net="$net"
+    local o_in4="${C[IN4_LOCAL]}/${C[IN4_PREFIX]:-30}" o_in6="${C[IN6_LOCAL]:-}"
+    if [[ -n "$O_MTU$O_LOCAL$O_PEER$O_INNER_NET$O_ROLE" ]]; then
+        # "|| exit 1": inside the menu's subshell errexit does not stop on a failed $(...)
+        if [[ -n "$O_MTU" ]]; then mtu=$(ask_mtu "$fam") || exit 1; fi
+        if [[ -n "$O_LOCAL" ]]; then loc=$(addr_arg "$fam" "$O_LOCAL" --local) || exit 1; fi
+        if [[ -n "$O_PEER" ]]; then rem=$(addr_arg "$fam" "$O_PEER" --peer) || exit 1; fi
+        if [[ -n "$O_INNER_NET" ]]; then net=$(norm_tun_net "$O_INNER_NET") || die "Invalid --inner-net (use 10.X.Y.0/30)."; fi
+        if [[ -n "$O_ROLE" ]]; then
+            [[ "$O_ROLE" == iran || "$O_ROLE" == foreign ]] || die "--role must be iran or foreign."
+            role="$O_ROLE"
+        fi
+    else
+        (( HAVE_TTY && ! ASSUME_YES )) || die "Nothing to change: pass --mtu, --local, --peer, --inner-net or --role."
+        while :; do
+            choose c "Edit tunnel $n (IPv$fam) - nothing changes until 'Apply'" \
+                "MTU: $mtu" \
+                "This server's public address: $loc" \
+                "Other server's public address: $rem" \
+                "Tunnel network (inner IPs): $net" \
+                "This server is the: $role server" \
+                "Apply"
+            case "$c" in
+                0) info "Nothing changed."; return 0 ;;
+                1) mtu=$(ask_mtu "$fam" "$mtu") || exit 1 ;;
+                2) ask_addr loc "$fam" "This server's public IPv$fam" "$loc" ;;
+                3) ask_addr rem "$fam" "The other server's public IPv$fam" "$rem" ;;
+                4) ask a "Tunnel network, the same on both servers (e.g. 10.45.12.0/30)" "$net"
+                   if a=$(norm_tun_net "$a"); then net="$a"; else warn "Use the form 10.X.Y.0/30."; fi ;;
+                5) choose a "This server is the" "Iran (entry) server" "Foreign (exit) server"
+                   case "$a" in 1) role=iran ;; 2) role=foreign ;; esac ;;
+                6) break ;;
+            esac
+        done
+    fi
+    if [[ "$mtu" == "$o_mtu" && "$role" == "$o_role" && "$net" == "$o_net" ]] \
+        && same_ip "$loc" "$o_loc" && same_ip "$rem" "$o_rem"; then
+        info "Nothing changed."
+        return 0
+    fi
+    if ! same_ip "$rem" "$o_rem"; then
+        for f in $(tun_list); do
+            [[ "$f" != "$n" ]] && same_ip "$(conf_val "$TUN_DIR/$f.conf" REMOTE)" "$rem" && die "Tunnel $f already goes to $rem."
+        done
+    fi
+    if ! same_ip "$loc" "$o_loc"; then local_has_addr "$loc" || warn "$loc is not configured on this server (fine only behind 1:1 NAT)."; fi
+    section "Changes to tunnel $n"
+    [[ "$mtu" == "$o_mtu" ]] || printf '  MTU:              %s -> %s\n' "$o_mtu" "$mtu"
+    same_ip "$loc" "$o_loc" || printf '  this server:      %s -> %s\n' "$o_loc" "$loc"
+    same_ip "$rem" "$o_rem" || printf '  other server:     %s -> %s\n' "$o_rem" "$rem"
+    [[ "$net" == "$o_net" ]] || printf '  tunnel network:   %s -> %s\n' "$o_net" "$net"
+    [[ "$role" == "$o_role" ]] || printf '  role:             %s -> %s\n' "$o_role" "$role"
+    if [[ "$net" != "$o_net" ]]; then
+        prefix_free "$net" || die "$net is already used on this server."
+        used=$(tunnel_used_by "$n")
+        if [[ -n "$used" ]]; then
+            warn "These use the inner addresses of $n and follow the change only if the other server changes too:"
+            printf '       %s\n' "$used"
+        fi
+    fi
+    if [[ "$mtu" != "$o_mtu" || "$net" != "$o_net" ]] || ! same_ip "$loc" "$o_loc" || ! same_ip "$rem" "$o_rem"; then
+        printf '\n%sChange the other server the same way%s, or the tunnel stops working:\n' "$YELLOW" "$NC"
+        printf '  gretun tunnel edit %s' "$n"
+        [[ "$mtu" == "$o_mtu" ]] || printf ' --mtu %s' "$mtu"
+        same_ip "$loc" "$o_loc" || printf ' --peer %s' "$loc"
+        same_ip "$rem" "$o_rem" || printf ' --local %s' "$rem"
+        [[ "$net" == "$o_net" ]] || printf ' --inner-net %s' "$net"
+        printf '   (on the other server; its tunnel name may differ)\n'
+    fi
+    confirm "Apply (the tunnel may drop for a moment)?" Y || return 0
+    rb_begin "edit tunnel $n"
+    tun_load "$n"
+    C[MTU]="$mtu" C[LOCAL]="$loc" C[REMOTE]="$rem" C[ROLE]="$role"
+    if [[ "$net" != "$o_net" ]]; then
+        fill_inner "$role" "$net"
+        if iface_exists "$n"; then
+            run ip addr del "$o_in4" dev "$n" 2>/dev/null || true
+            if [[ -n "$o_in6" ]]; then run ip -6 addr del "$o_in6/64" dev "$n" 2>/dev/null || true; fi
+        fi
+        rb_undo ip addr del "${C[IN4_LOCAL]}/${C[IN4_PREFIX]}" dev "$n"
+        rb_undo ip -6 addr del "${C[IN6_LOCAL]}/64" dev "$n"
+    fi
+    tun_save
+    if ! same_ip "$rem" "$o_rem"; then
+        ufw_gre delete "$o_rem"
+        ufw_gre allow "$rem"
+        rb_undo ufw_gre allow "$o_rem"
+        rb_undo ufw_gre delete "$rem"
+    fi
+    sync_all || warn "Some parts could not be applied; see: gretun doctor"
+    tunnel_status "$n"
+    rb_arm 300
+}
+
 # ---------------------------------------------------------------- imports
 legacy_present() {
     [[ -f "$LEGACY_DIR/imported-haproxy-forwarder" ]] && return 1
@@ -2820,6 +2927,72 @@ alloc_pref() {  # alloc_pref NODE: keeps the node's pref, else the next free blo
     die "Too many PasarGuard nodes."
 }
 
+# ---------------------------------------------------------------- WireGuard interface of a node
+# The panel names the interface (core "interface_name"): wg0 for the first
+# core, often wg1, wg2 ... for more. Never assume wg0.
+wg_ifaces() {  # every WireGuard interface on this server, one per line
+    ip -o link show type wireguard 2>/dev/null | awk -F': ' '{ sub(/@.*/, "", $2); print $2 }'
+}
+wg_nets() {  # wg_nets IFACE 4|6: networks of its addresses, e.g. "10.0.0.0/16"
+    local a out=""
+    if [[ "$2" == 4 ]]; then
+        while read -r a; do [[ -n "$a" ]] && out+="$(cidr_norm "$a") "; done \
+            < <(ip -o -4 addr show dev "$1" 2>/dev/null | awk '{print $4}')
+    else
+        while read -r a; do [[ -n "$a" ]] && out+="$(cidr_norm "$a") "; done \
+            < <(ip -o -6 addr show dev "$1" scope global 2>/dev/null | awk '{print $4}')
+    fi
+    printf '%s' "${out% }"
+}
+wg_by_table() {  # wg_by_table TABLE: the interface in the node's own "iif X lookup TABLE" rule
+    [[ -n "$1" ]] || return 0
+    ip -4 rule show 2>/dev/null | awk -v t="$1" '{ d = ""; l = ""
+        for (i = 1; i < NF; i++) { if ($i == "iif") d = $(i + 1); if ($i == "lookup") l = $(i + 1) }
+        sub(/@.*/, "", d)
+        if (d != "" && l == t) { print d; exit } }'
+}
+# pg_pick_wg VAR TABLE OLD_WG_IF: --wg-if, else the interface of the node's
+# own ip rule, else the saved one if it exists, else the only WireGuard
+# interface, else a question.
+pg_pick_wg() {
+    local __pw_w __pw_c
+    local -a __pw_list=() __pw_opts=()
+    if [[ -n "$O_WG_IF" ]]; then printf -v "$1" '%s' "$O_WG_IF"; return 0; fi
+    __pw_w=$(wg_by_table "$2")
+    if [[ -n "$__pw_w" ]]; then
+        info "WireGuard interface of the node: $__pw_w (its ip rule 'iif $__pw_w lookup $2')"
+        printf -v "$1" '%s' "$__pw_w"
+        return 0
+    fi
+    if [[ -n "$3" ]] && iface_exists "$3"; then printf -v "$1" '%s' "$3"; return 0; fi
+    mapfile -t __pw_list < <(wg_ifaces)
+    case "${#__pw_list[@]}" in
+        0)
+            printf -v "$1" '%s' "${3:-wg0}"
+            warn "No WireGuard interface exists on this server right now; using ${3:-wg0}."
+            hint "It appears when the panel sends the WireGuard core. If the core's interface_name is not ${3:-wg0},"
+            hint "change it later with: gretun pg edit --wg-if NAME" ;;
+        1)
+            info "WireGuard interface of the node: ${__pw_list[0]}"
+            printf -v "$1" '%s' "${__pw_list[0]}" ;;
+        *)
+            (( HAVE_TTY && ! ASSUME_YES )) || die "Several WireGuard interfaces (${__pw_list[*]}): choose one with --wg-if."
+            for __pw_w in "${__pw_list[@]}"; do __pw_opts+=("$__pw_w  ($(wg_nets "$__pw_w" 4) $(wg_nets "$__pw_w" 6))"); done
+            choose __pw_c "Which WireGuard interface belongs to this node?" "${__pw_opts[@]}"
+            (( __pw_c > 0 )) || exit 0
+            printf -v "$1" '%s' "${__pw_list[__pw_c - 1]}" ;;
+    esac
+}
+# wg_mismatch WG V4 V6: prints a warning line when WG exists and its own
+# networks are not the ones entered (the panel's Address field decides).
+wg_mismatch() {
+    local n4 n6 x
+    iface_exists "$1" || return 0
+    n4=$(wg_nets "$1" 4) n6=$(wg_nets "$1" 6)
+    for x in $n4; do [[ " $2 " == *" $x "* ]] || { printf '%s has %s, which is not in the IPv4 subnets (%s)\n' "$1" "$x" "${2:-none}"; }; done
+    for x in $n6; do [[ " $3 " == *" $x "* ]] || { printf '%s has %s, which is not in the IPv6 subnets (%s): those clients get no IPv6\n' "$1" "$x" "${3:-none}"; }; done
+}
+
 # ---------------------------------------------------------------- Iran: setup
 cmd_pg_setup() {
     legacy_guard
@@ -2850,17 +3023,26 @@ cmd_pg_setup() {
     [[ "${C[ROLE]}" == iran ]] || die "Tunnel $tun is a foreign-side tunnel; use an Iran-side one."
     local old=""
     if [[ -f "$PG_DIR/$name.conf" ]]; then old="$PG_DIR/$name.conf"; fi
+    # The WireGuard interface first: its addresses are the best default subnets.
+    local wtbl d4 d6
+    wtbl="${O_TABLE:-$(conf_val "${old:-/dev/null}" TABLE)}"
+    [[ -n "$wtbl" ]] || wtbl=$(env_get "$env" PG_NODE_WG_ROUTE_TABLE)
+    pg_pick_wg wg "$wtbl" "$(conf_val "${old:-/dev/null}" WG_IF)"
+    d4=$(wg_nets "$wg" 4) d6=$(wg_nets "$wg" 6)
+    [[ -n "$d4" ]] || d4=$(conf_val "${old:-/dev/null}" V4_SUBNETS)
+    [[ -n "$d6" ]] || d6=$(conf_val "${old:-/dev/null}" V6_SUBNETS)
     printf '\nWireGuard client subnets: exactly what the panel core uses in its Address field.\n'
-    ask_subnets v4 4 "$O_V4" "Client IPv4 subnet(s), e.g. 10.0.0.0/16" "$(conf_val "${old:-/dev/null}" V4_SUBNETS)"
-    if [[ -z "$O_V6" && -n "$O_V4" ]] && (( ASSUME_YES || ! HAVE_TTY )); then v6=""
-    else ask_subnets v6 6 "$O_V6" "Client IPv6 subnet(s), e.g. fd10:10::/64 (or 'none')" "$(conf_val "${old:-/dev/null}" V6_SUBNETS)" optional; fi
+    if [[ -n "$d4$d6" ]] && iface_exists "$wg"; then printf '(%s has: %s)\n' "$wg" "$d4 $d6"; fi
+    ask_subnets v4 4 "$O_V4" "Client IPv4 subnet(s), e.g. 10.0.0.0/16" "$d4"
+    if [[ -z "$O_V6" && -n "$O_V4" ]] && (( ASSUME_YES || ! HAVE_TTY )); then v6="$d6"
+    else ask_subnets v6 6 "$O_V6" "Client IPv6 subnet(s), e.g. fd10:10::/64 (or 'none')" "$d6" optional; fi
     local x net4 net6
     net4=$(cidr_norm "$(conf_val "$TUN_DIR/$tun.conf" IN4_LOCAL)/$(conf_val "$TUN_DIR/$tun.conf" IN4_PREFIX 30)")
     net6=$(cidr_norm "$(conf_val "$TUN_DIR/$tun.conf" IN6_LOCAL)/64")
     for x in $v4; do cidr_overlap "$x" "$net4" && die "$x overlaps the tunnel network $net4."; done
     for x in $v6; do cidr_overlap "$x" "$net6" && die "$x overlaps the tunnel network $net6."; done
-    wg="${O_WG_IF:-$(conf_val "${old:-/dev/null}" WG_IF wg0)}"
-    tbl="${O_TABLE:-$(conf_val "${old:-/dev/null}" TABLE)}"
+    # The table the node already uses (.env) is kept, so its own rule stays valid.
+    tbl="$wtbl"
     [[ -n "$tbl" ]] || tbl=$(alloc_table)
     valid_table "$tbl" || die "Invalid table number: $tbl (use 1-251 or 256 and up)"
     if [[ -z "$O_TABLE" && -z "$O_WG_IF" ]] && want_advanced "routing table $tbl, WireGuard interface $wg"; then
@@ -2894,7 +3076,14 @@ cmd_pg_setup() {
                   PG_NODE_WG_NAT_EGRESS_ONLY=0  PG_NODE_WG_NAT_DISABLE=0
                   PG_NODE_WG_ROUTE_TABLE=$tbl  PG_NODE_WG_ROUTE_OUT_INTERFACE=$tun
 EOF
-    confirm "Apply (the node restarts; clients reconnect within seconds)?" Y || return 0
+    local def=Y line
+    if ! iface_exists "$wg" && [[ -n "$(wg_ifaces)" ]]; then
+        warn "$wg does not exist, but these WireGuard interfaces do: $(wg_ifaces | paste -sd' ' -)"
+        hint "With the wrong interface IPv6 does not work. Use the core's interface_name (--wg-if, or the advanced settings)."
+        def=N
+    fi
+    while read -r line; do [[ -n "$line" ]] && warn "$line"; done < <(wg_mismatch "$wg" "$v4" "$v6")
+    confirm "Apply (the node restarts; clients reconnect within seconds)?" "$def" || return 0
 
     rb_begin "PasarGuard $name via $tun"
     rb_save_file "$env"
@@ -2996,8 +3185,21 @@ pg_verify() {  # pg_verify NODE
         out=$(offload_state "$wg")
         if [[ "$out" == *on* ]]; then warn "offload $wg: $out"; fails=$((fails + 1)); else ok "offload $wg: $out"; fi
     else
-        warn "$wg does not exist yet"
+        local real
+        real=$(wg_by_table "$tbl")
+        if [[ -n "$real" ]]; then
+            err "$wg does not exist: the node's WireGuard interface is $real (ip rule 'iif $real lookup $tbl')"
+            hint "IPv6 of the clients does not work like this. Fix: gretun pg edit $1 --wg-if $real"
+            fails=$((fails + 1))
+        elif [[ -n "$(wg_ifaces)" ]]; then
+            err "$wg does not exist; WireGuard interfaces here: $(wg_ifaces | paste -sd' ' -)"
+            hint "Fix: gretun pg edit $1 --wg-if NAME   (NAME = interface_name of the panel's WireGuard core)"
+            fails=$((fails + 1))
+        else
+            warn "$wg does not exist yet (it appears when the panel sends the WireGuard core)"
+        fi
     fi
+    while read -r out; do [[ -n "$out" ]] && { warn "$out"; fails=$((fails + 1)); }; done < <(wg_mismatch "$wg" "$(cget V4_SUBNETS)" "$v6")
     [[ "$(sysctl_get net.ipv6.conf.all.forwarding)" == 1 && "$(sysctl_get net.ipv4.ip_forward)" == 1 ]] \
         && ok "forwarding on (IPv4 + IPv6)" || { err "forwarding is off"; fails=$((fails + 1)); }
     C=()
@@ -3055,6 +3257,78 @@ cmd_pg_remove() {
     pg_restart "$dir" "$name" "$cli" "$cont" "$wg" || true
     ok "Node $name is back to its own settings."
     rb_arm 300
+}
+
+# pg edit: change the WireGuard interface, subnets, table or tunnel of a node
+# setup; applied through the normal setup (same checks, restart, rollback).
+pick_conf() {  # pick_conf VAR DIR "title": one of DIR/*.conf (by name)
+    local __pc_f __pc_c
+    local -a __pc_l=()
+    for __pc_f in "$2"/*.conf; do __pc_l+=("$(basename "$__pc_f" .conf)"); done
+    (( ${#__pc_l[@]} )) || die "Nothing set up yet."
+    if (( ${#__pc_l[@]} == 1 )); then printf -v "$1" '%s' "${__pc_l[0]}"; return 0; fi
+    choose __pc_c "$3" "${__pc_l[@]}"
+    (( __pc_c > 0 )) || exit 0
+    printf -v "$1" '%s' "${__pc_l[__pc_c - 1]}"
+}
+cmd_pg_edit() {
+    local name="${ARGS[0]:-$O_NODE}" f c a tun v4 v6 tbl wg miss
+    if [[ -z "$name" ]]; then pick_conf name "$PG_DIR" "Edit which node setup?"; fi
+    f="$PG_DIR/$name.conf"
+    [[ -f "$f" ]] || die "No gretun setup for node $name (set it up first: gretun pg setup)."
+    local o_tun o_v4 o_v6 o_tbl o_wg
+    o_tun=$(conf_val "$f" TUNNEL) o_v4=$(conf_val "$f" V4_SUBNETS) o_v6=$(conf_val "$f" V6_SUBNETS)
+    o_tbl=$(conf_val "$f" TABLE) o_wg=$(conf_val "$f" WG_IF wg0)
+    tun="${O_TUNNEL:-$o_tun}" tbl="${O_TABLE:-$o_tbl}" wg="${O_WG_IF:-$o_wg}" v4="$o_v4" v6="$o_v6"
+    if [[ -n "$O_V4" ]]; then ask_subnets v4 4 "$O_V4" "" ""; fi
+    if [[ -n "$O_V6" ]]; then ask_subnets v6 6 "$O_V6" "" "" optional; fi
+    if [[ -z "$O_TUNNEL$O_V4$O_V6$O_TABLE$O_WG_IF" ]]; then
+        (( HAVE_TTY && ! ASSUME_YES )) || die "Nothing to change: pass --wg-if, --v4, --v6, --table or --tunnel."
+        while :; do
+            miss=""
+            iface_exists "$wg" || miss="  (does not exist! WireGuard here: $(wg_ifaces | paste -sd' ' -))"
+            choose c "Edit node $name - nothing changes until 'Apply'" \
+                "WireGuard interface: $wg$miss" \
+                "Client IPv4 subnets: $v4" \
+                "Client IPv6 subnets: ${v6:-none}" \
+                "Routing table: $tbl" \
+                "Tunnel: $tun" \
+                "Apply"
+            case "$c" in
+                0) info "Nothing changed."; return 0 ;;
+                1) if [[ -n "$(wg_ifaces)" ]]; then printf 'WireGuard interfaces here: %s\n' "$(wg_ifaces | paste -sd' ' -)"; fi
+                   ask a "WireGuard interface (interface_name of the panel's WireGuard core)" "$(wg_by_table "$tbl" | grep . || printf '%s' "$wg")"
+                   if [[ "$a" =~ ^[a-zA-Z0-9_.-]{1,15}$ ]]; then wg="$a"; else warn "Not a valid interface name."; fi
+                   a="$(wg_nets "$wg" 4) $(wg_nets "$wg" 6)"
+                   if [[ -n "${a// /}" ]]; then printf '(%s has: %s)\n' "$wg" "$a"; fi ;;
+                2) ask_subnets v4 4 "" "Client IPv4 subnet(s)" "$v4" ;;
+                3) ask_subnets v6 6 "" "Client IPv6 subnet(s) (or 'none')" "${v6:-none}" optional ;;
+                4) ask a "Routing table number (PG_NODE_WG_ROUTE_TABLE)" "$tbl"
+                   if ! valid_table "$a"; then warn "Use a number 1-251 or 256 and up."
+                   elif [[ "$a" != "$o_tbl" ]] && ! table_free "$a"; then
+                       warn "Table $a is already used on this server."
+                       if confirm "Use it anyway?" N; then tbl="$a"; fi
+                   else tbl="$a"; fi ;;
+                5) local o_save="$O_TUNNEL"
+                   O_TUNNEL=""
+                   pick_tunnel tun iran
+                   O_TUNNEL="$o_save" ;;
+                6) break ;;
+            esac
+        done
+    fi
+    if [[ "$tun" == "$o_tun" && "$v4" == "$o_v4" && "$v6" == "$o_v6" && "$tbl" == "$o_tbl" && "$wg" == "$o_wg" ]]; then
+        info "Nothing changed."
+        return 0
+    fi
+    if [[ "$v4" != "$o_v4" || "$v6" != "$o_v6" || "$tun" != "$o_tun" ]]; then
+        warn "Subnets or tunnel change: add the new exit key (shown at the end) on the foreign server too."
+    fi
+    # The node is found again by name; its directory is used if discovery misses it.
+    O_NODE="$name" O_NODE_DIR=""
+    if ! pg_detect | grep -q "^$name|"; then O_NODE_DIR=$(conf_val "$f" NODE_DIR); fi
+    O_TUNNEL="$tun" O_V4="$v4" O_V6="${v6:-none}" O_TABLE="$tbl" O_WG_IF="$wg"
+    cmd_pg_setup
 }
 
 # ---------------------------------------------------------------- foreign: exit
@@ -3171,6 +3445,53 @@ cmd_exit_remove() {
     rb_arm 300
 }
 
+# exit edit: client subnets and WAN interfaces of an exit.
+cmd_exit_edit() {
+    local t="${ARGS[0]:-$O_TUNNEL}" f c v4 v6 w4 w6
+    if [[ -z "$t" ]]; then pick_conf t "$EXIT_DIR" "Edit which exit?"; fi
+    f="$EXIT_DIR/$t.conf"
+    [[ -f "$f" ]] || die "No exit for $t (add one first: gretun exit add)."
+    local o_v4 o_v6 o_w4 o_w6
+    o_v4=$(conf_val "$f" V4_SUBNETS) o_v6=$(conf_val "$f" V6_SUBNETS) o_w4=$(conf_val "$f" WAN4 auto) o_w6=$(conf_val "$f" WAN6 auto)
+    v4="$o_v4" v6="$o_v6" w4="$o_w4" w6="$o_w6"
+    if [[ -n "$O_V4" ]]; then ask_subnets v4 4 "$O_V4" "" ""; fi
+    if [[ -n "$O_V6" ]]; then ask_subnets v6 6 "$O_V6" "" "" optional; fi
+    if [[ -n "$O_WAN" ]]; then
+        [[ "$O_WAN" == auto ]] || iface_exists "$O_WAN" || die "Interface $O_WAN does not exist."
+        w4="$O_WAN" w6="$O_WAN"
+    fi
+    if [[ -z "$O_V4$O_V6$O_WAN" ]]; then
+        (( HAVE_TTY && ! ASSUME_YES )) || die "Nothing to change: pass --v4, --v6 or --wan."
+        while :; do
+            choose c "Edit the exit via $t - nothing changes until 'Apply'" \
+                "Client IPv4 subnets: $v4" "Client IPv6 subnets: ${v6:-none}" \
+                "IPv4 WAN interface: $w4" "IPv6 WAN interface: $w6" "Apply"
+            case "$c" in
+                0) info "Nothing changed."; return 0 ;;
+                1) ask_subnets v4 4 "" "Client IPv4 subnet(s) of the Iran node" "$v4" ;;
+                2) ask_subnets v6 6 "" "Client IPv6 subnet(s) (or 'none')" "${v6:-none}" optional ;;
+                3) ask_wan w4 4 ;;
+                4) ask_wan w6 6 ;;
+                5) break ;;
+            esac
+        done
+    fi
+    if [[ "$v4" == "$o_v4" && "$v6" == "$o_v6" && "$w4" == "$o_w4" && "$w6" == "$o_w6" ]]; then
+        info "Nothing changed."
+        return 0
+    fi
+    section "Exit via $t"
+    printf '  IPv4 subnets: %s -> %s\n  IPv6 subnets: %s -> %s\n  WAN:          %s/%s -> %s/%s\n' \
+        "${o_v4:-none}" "${v4:-none}" "${o_v6:-none}" "${v6:-none}" "$o_w4" "$o_w6" "$w4" "$w6"
+    confirm "Apply?" Y || return 0
+    rb_begin "edit exit $t"
+    C=([TUNNEL]="$t" [V4_SUBNETS]="$v4" [V6_SUBNETS]="$v6" [WAN4]="$w4" [WAN6]="$w6")
+    write_file "$f" 640 "$(conf_text "${EXIT_KEYS[@]}")" || true
+    sync_all || warn "Some parts could not be applied."
+    exit_verify "$t" || true
+    rb_arm 300
+}
+
 # ======================================================================
 # Extras: status, doctor, bench, tuning, alerts, install/uninstall
 # ======================================================================
@@ -3279,9 +3600,19 @@ cmd_doctor() {
     [[ -n "$out" ]] && printf '%s\n' "$out" | sed 's/^/       ip rule     /'
     out=$(ip -6 rule show | grep -vE '^(0|32766|32767):' || true)
     [[ -n "$out" ]] && printf '%s\n' "$out" | sed 's/^/       ip -6 rule  /'
-    local f tbl
+    local f tbl wgi real
     for f in "$PG_DIR"/*.conf; do
-        tbl=$(conf_val "$f" TABLE) t=$(conf_val "$f" TUNNEL)
+        tbl=$(conf_val "$f" TABLE) t=$(conf_val "$f" TUNNEL) wgi=$(conf_val "$f" WG_IF wg0)
+        if ! iface_exists "$wgi"; then
+            real=$(wg_by_table "$tbl")
+            if [[ -n "$real" ]]; then
+                dr_bad "node $(basename "$f" .conf): $wgi does not exist, the node uses $real"
+                hint "gretun pg edit $(basename "$f" .conf) --wg-if $real"
+            elif [[ -n "$(wg_ifaces)" ]]; then
+                dr_bad "node $(basename "$f" .conf): $wgi does not exist (WireGuard here: $(wg_ifaces | paste -sd' ' -))"
+                hint "gretun pg edit $(basename "$f" .conf) --wg-if NAME"
+            fi
+        fi
         out=$(ip -4 route show table "$tbl" 2>/dev/null)
         grep -q "^default dev $t" <<<"$out" && dr_ok "table $tbl IPv4: default dev $t" \
             || { dr_bad "table $tbl IPv4 has no 'default dev $t' (clients get 'unreachable')"; hint "Is $t up? gretun heal"; }
@@ -3583,7 +3914,8 @@ menu_tunnel() {
             "Show the connection key of a tunnel" \
             "Remove a tunnel" \
             "Import an existing tunnel (gre1 manual / haproxy-forwarder)" \
-            "Alerts (ntfy) when a tunnel goes down"
+            "Alerts (ntfy) when a tunnel goes down" \
+            "Edit a tunnel (MTU, server addresses, tunnel network, role)"
         case "$c" in
             0) return 0 ;;
             1) O_ROLE=foreign; run_action cmd_tunnel_add; O_ROLE="" ;;
@@ -3597,6 +3929,7 @@ menu_tunnel() {
                choose a "Alerts" "Set the ntfy URL" "Send a test alert" "Turn alerts off"
                case "$a" in 1) ARGS=(set) ;; 2) ARGS=(test) ;; 3) ARGS=(off) ;; *) continue ;; esac
                run_action cmd_alert ;;
+            9) ARGS=(); run_action cmd_tunnel_edit ;;
         esac
     done
 }
@@ -3624,11 +3957,14 @@ menu_pg() {
             "Show what to set in the PasarGuard panel" \
             "Show the exit key again (Iran)" \
             "Iran: undo the node setup" \
-            "Foreign: remove an exit"
+            "Foreign: remove an exit" \
+            "Iran: edit the node setup (WireGuard interface, subnets, table, tunnel)" \
+            "Foreign: edit an exit (subnets, WAN interface)"
         ARGS=()
         case "$c" in
             0) return 0 ;; 1) run_action cmd_pg_setup ;; 2) run_action cmd_exit_add ;; 3) run_action cmd_pg_status ;;
             4) run_action cmd_pg_panel ;; 5) run_action cmd_pg_key ;; 6) run_action cmd_pg_remove ;; 7) run_action cmd_exit_remove ;;
+            8) run_action cmd_pg_edit ;; 9) run_action cmd_exit_edit ;;
         esac
     done
 }
@@ -3687,6 +4023,8 @@ Usage: gretun                         interactive menu
   tunnel list | status [NAME]        state, ping/RTT/loss (v4+v6), traffic
   tunnel key NAME [--raw]            print the connection key again (foreign side)
   tunnel remove NAME [--force]
+  tunnel edit [NAME] [--mtu N] [--local IP] [--peer IP] [--inner-net 10.X.Y.0/30] [--role iran|foreign]
+                                     change a tunnel (no options: interactive editor)
   tunnel import manual [--if gre1] [--role iran|foreign] [--inner-peer IP]
   tunnel import legacy               take over HAProxy.sh / HAProxy-GRE6.sh
 
@@ -3696,9 +4034,12 @@ Usage: gretun                         interactive menu
 
 3) PasarGuard WireGuard node via GRE
   pg setup [--node NAME|--node-dir /opt/NAME] [--tunnel gre1] --v4 10.0.0.0/16 [--v6 fd10:10::/64]
-           [--table N] [--wg-if wg0]          Iran server; prints an exit key
+           [--table N] [--wg-if wgX]          Iran server; prints an exit key
+                                     (the WireGuard interface is detected; --wg-if overrides)
+  pg edit [NODE] [--wg-if wg1] [--v4 CIDR] [--v6 CIDR|none] [--table N] [--tunnel gre1]
   pg status | verify | panel | key | remove [NODE]
   exit add --key EXIT_KEY  |  exit add --tunnel gre1 --v4 CIDR [--v6 CIDR] [--wan eth0]
+  exit edit [TUNNEL] [--v4 CIDR] [--v6 CIDR|none] [--wan eth0|auto]
   exit list | remove TUNNEL                   foreign server
 
 Tools
@@ -3795,7 +4136,7 @@ main() {
         tunnel|tunnels|t)
             case "$sub" in
                 add) self_install; cmd_tunnel_add ;; list|status|"") tunnel_status "${ARGS[0]:-}" ;;
-                key) cmd_tunnel_key ;; remove|rm|del) cmd_tunnel_remove ;;
+                key) cmd_tunnel_key ;; remove|rm|del) cmd_tunnel_remove ;; edit|set) cmd_tunnel_edit ;;
                 import) self_install; cmd_import ;;
                 *) die "Unknown: gretun tunnel $sub (see: gretun help)" ;;
             esac ;;
@@ -3809,13 +4150,13 @@ main() {
         pg|pasarguard)
             case "$sub" in
                 setup|add) self_install; cmd_pg_setup ;; status|verify|"") cmd_pg_status ;; panel) cmd_pg_panel ;;
-                key) cmd_pg_key ;; remove|rm|del) cmd_pg_remove ;;
+                key) cmd_pg_key ;; remove|rm|del) cmd_pg_remove ;; edit|set) self_install; cmd_pg_edit ;;
                 *) die "Unknown: gretun pg $sub" ;;
             esac ;;
         exit)
             case "$sub" in
                 add) self_install; cmd_exit_add ;; list|"") cmd_exit_list ;; status|verify) cmd_pg_status ;;
-                remove|rm|del) cmd_exit_remove ;;
+                remove|rm|del) cmd_exit_remove ;; edit|set) cmd_exit_edit ;;
                 *) die "Unknown: gretun exit $sub" ;;
             esac ;;
         status) ARGS=("$sub" "${ARGS[@]}"); cmd_status ;;
