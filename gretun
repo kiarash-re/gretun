@@ -1,0 +1,3648 @@
+#!/usr/bin/env bash
+#
+# gretun - GRE tunnels, IPv6 port forwarder and PasarGuard WireGuard exit
+#
+#   1) GRE tunnel      IPv4 (gre) or IPv6 (ip6gre) transport between an Iran
+#                      "entry" server and a foreign "exit" server; every tunnel
+#                      carries both IPv4 and IPv6 inside. Paired with a
+#                      connection key printed on the foreign server.
+#   2) IPv6 forwarder  Iran IPv4 ports -> foreign IPv6 (or a tunnel IP).
+#                      TCP via HAProxy, UDP via a dedicated nginx-stream unit.
+#   3) PasarGuard WG   WireGuard clients of a PasarGuard node on the Iran
+#                      server leave the internet from the foreign server.
+#
+# Run without arguments for the menu, or "gretun help" for the CLI.
+#
+# Safety rules this script follows:
+#   * never changes the default route, SSH or the server's own traffic;
+#   * never flushes whole rulesets and never enables nftables.service;
+#   * only removes what it created: nft tables "gretun*", iptables chains
+#     "GRETUN-*", routes with "proto 147", ip rules with pref 14700-14799,
+#     interfaces listed in /var/lib/gretun/owned and files it wrote;
+#   * routing changes are rolled back automatically unless confirmed.
+#
+# shellcheck disable=SC2317  # functions are reached through dispatch tables
+# shellcheck disable=SC2015  # "check && ok || err": ok/info/dr_* always return 0
+set -Eeuo pipefail
+shopt -s nullglob
+
+readonly VERSION="1.0.0"
+readonly MARK="# Managed by gretun"
+
+# GRETUN_ROOT prefixes every path and switches off systemd/udev calls. It is
+# used by the network-namespace test suite; leave it unset on real servers.
+R="${GRETUN_ROOT:-}"
+TEST_MODE=0
+if [[ -n "$R" ]]; then TEST_MODE=1; fi
+
+ETC="$R/etc/gretun"
+TUN_DIR="$ETC/tunnels"
+PG_DIR="$ETC/pg"
+EXIT_DIR="$ETC/exit"
+RULES="$ETC/forward.rules"
+BK="$ETC/backups"
+LEGACY_DIR="$ETC/legacy"
+GLOBAL_CONF="$ETC/gretun.conf"
+ALERT_CONF="$ETC/alert.conf"
+TUNE_PREV="$ETC/tune.prev"
+STATE="$R/var/lib/gretun"
+OWNED="$STATE/owned"
+RB_DIR="$STATE/rollback"
+RUNDIR="$R/run/gretun"
+LOCK="$R/run/gretun.lock"
+SYSTEMD_DIR="$R/etc/systemd/system"
+UDEV_RULE="$R/etc/udev/rules.d/90-gretun-offload.rules"
+SYSCTL_FWD="$R/etc/sysctl.d/90-gretun-forward.conf"
+SYSCTL_TUNE="$R/etc/sysctl.d/99-gretun.conf"
+MODULES_FILE="$R/etc/modules-load.d/gretun.conf"
+HAPROXY_CFG="$R/etc/haproxy/haproxy.cfg"
+HAPROXY_DROPIN="$SYSTEMD_DIR/haproxy.service.d/90-gretun.conf"
+UDP_UNIT="gretun-udp"
+UDP_CFG="$ETC/udp-nginx.conf"
+NGINX_STREAM_MODULE="/usr/lib/nginx/modules/ngx_stream_module.so"
+INSTALL_PATH="/usr/local/sbin/gretun"
+SELF="${GRETUN_SELF:-$INSTALL_PATH}"
+
+readonly RT_PROTO=147            # "proto 147" marks every route gretun adds
+readonly PREF_MIN=14700          # ip rule priorities owned by gretun
+readonly PREF_MAX=14799
+readonly NFT_T="gretun"          # inet gretun, ip gretun_nat, ip6 gretun_nat
+readonly NFT_FWD="gretun_fwd"    # per-port counters of the forwarder
+readonly ULA_BASE="fd47:4752"    # inner IPv6 prefixes: fd47:4752:XXXX:XXXX::/64
+readonly BACKUP_KEEP=10
+readonly NOFILE_LIMIT=1048576
+readonly HEALTH_CHECK="check inter 10s fall 3 rise 2"
+readonly UDP_TIMEOUT="10m"
+readonly KEY_PREFIX="gretun://"
+readonly LEGACY_KEY_PREFIX="gre6://"
+readonly EXIT_PREFIX="gretun-exit://"
+readonly MTU_MIN=1280
+readonly UNREACH_METRIC=4294967295
+
+# ---------------------------------------------------------------- options
+ASSUME_YES=0 DRY=0 AUTO_CONFIRM=0 RB_SECS="" FORCE=0 PURGE=0 RAW=0
+REPLACE_HAPROXY=0 BENCH_SERVER=0
+O_ROLE="" O_FAMILY="" O_PEER="" O_LOCAL="" O_MTU="" O_NAME="" O_KEY="" O_IF=""
+O_DEST="" O_PORTS="" O_PROTO="" O_PROXY=0 O_CHECK=0 O_INTERVAL=2
+O_NODE="" O_NODE_DIR="" O_TUNNEL="" O_V4="" O_V6="" O_TABLE="" O_WG_IF="" O_WAN=""
+O_URL="" O_TOKEN="" O_TIME=10 O_INNER_PEER="" O_INNER_NET=""
+ARGS=()
+HEAL_MODE=0
+HAVE_TTY=0
+if (exec </dev/tty) 2>/dev/null; then HAVE_TTY=1; fi
+
+RED="" GREEN="" YELLOW="" BLUE="" BOLD="" DIM="" NC=""
+set_colors() {
+    if [[ -t 1 && -z "${NO_COLOR:-}" ]]; then
+        RED=$'\033[0;31m' GREEN=$'\033[0;32m' YELLOW=$'\033[1;33m'
+        BLUE=$'\033[0;36m' BOLD=$'\033[1m' DIM=$'\033[2m' NC=$'\033[0m'
+    else
+        RED="" GREEN="" YELLOW="" BLUE="" BOLD="" DIM="" NC=""
+    fi
+}
+set_colors
+
+# ---------------------------------------------------------------- output
+jlog() { logger -t gretun -- "$*" >/dev/null 2>&1 || true; }
+info() { printf '%s[..]%s %s\n' "$BLUE" "$NC" "$*"; }
+ok()   { printf '%s[OK]%s %s\n' "$GREEN" "$NC" "$*"; jlog "ok: $*"; }
+warn() { printf '%s[!!]%s %s\n' "$YELLOW" "$NC" "$*" >&2; jlog "warning: $*"; }
+err()  { printf '%s[XX]%s %s\n' "$RED" "$NC" "$*" >&2; jlog "error: $*"; }
+die()  { err "$*"; exit 1; }
+hint() { printf '     %s-> %s%s\n' "$DIM" "$*" "$NC"; }
+section() { printf '\n%s== %s ==%s\n' "$BOLD" "$*" "$NC"; }
+quiet() { "$@" >/dev/null 2>&1; }
+have() { command -v "$1" >/dev/null 2>&1; }
+os_field() { awk -F= -v k="$1" '$1 == k { gsub(/"/, "", $2); print $2 }' /etc/os-release 2>/dev/null || true; }
+
+# Every command that changes the system goes through run/run_in, so
+# --dry-run prints it instead.
+run() {
+    if (( DRY )); then
+        printf '%s[dry-run]%s' "$DIM" "$NC"
+        printf ' %q' "$@"
+        printf '\n'
+        return 0
+    fi
+    jlog "run: $*"
+    "$@"
+}
+run_in() {  # run_in CMD... < input
+    if (( DRY )); then
+        printf '%s[dry-run]%s' "$DIM" "$NC"
+        printf ' %q' "$@"
+        printf ' <<EOF\n'
+        cat
+        printf 'EOF\n'
+        return 0
+    fi
+    jlog "run: $* (with input)"
+    "$@"
+}
+# write_file PATH MODE CONTENT: returns 0 when the file changed
+write_file() {
+    local path="$1" mode="$2" content="$3" tmp
+    if [[ -f "$path" && "$(cat "$path")" == "$content" ]]; then
+        return 1
+    fi
+    if (( DRY )); then
+        printf '%s[dry-run]%s write %s\n' "$DIM" "$NC" "$path"
+        return 0
+    fi
+    mkdir -p "$(dirname "$path")"
+    tmp=$(mktemp "$path.XXXXXX")
+    printf '%s\n' "$content" >"$tmp"
+    chmod "$mode" "$tmp"
+    mv -f "$tmp" "$path"
+    jlog "wrote $path"
+    return 0
+}
+remove_file() {
+    [[ -e "$1" ]] || return 0
+    run rm -f -- "$1"
+}
+
+# ---------------------------------------------------------------- prompts
+ask() {  # ask VAR "Prompt" [default]
+    local __a="" __d="${3:-}"
+    if (( ASSUME_YES || ! HAVE_TTY )); then
+        [[ -n "$__d" ]] || die "Missing value for: $2 (pass it as a CLI flag, see: gretun help)"
+        printf -v "$1" '%s' "$__d"
+        return 0
+    fi
+    read -r -p "$2${__d:+ [$__d]}: " __a </dev/tty || true
+    __a="${__a#"${__a%%[![:space:]]*}"}"
+    __a="${__a%"${__a##*[![:space:]]}"}"
+    printf -v "$1" '%s' "${__a:-$__d}"
+}
+confirm() {  # confirm "Question" [Y|N]
+    local d="${2:-N}" a=""
+    if (( ASSUME_YES )); then return 0; fi
+    if (( ! HAVE_TTY )); then [[ "$d" == Y ]]; return; fi
+    if [[ "$d" == Y ]]; then
+        read -r -p "$1 [Y/n]: " a </dev/tty || true
+        [[ -z "$a" || "$a" == [yY]* ]]
+    else
+        read -r -p "$1 [y/N]: " a </dev/tty || true
+        [[ "$a" == [yY]* ]]
+    fi
+}
+pause() {
+    if (( HAVE_TTY && ! ASSUME_YES )); then
+        read -r -p "Press Enter to continue..." _ </dev/tty || true
+    fi
+}
+choose() {  # choose VAR "Title" option... -> VAR=1..N (0 = back)
+    local __var="$1" __title="$2" __i=1 __a
+    shift 2
+    printf '\n%s%s%s\n' "$BOLD" "$__title" "$NC"
+    for __a in "$@"; do
+        printf '  %s%2d)%s %s\n' "$GREEN" "$__i" "$NC" "$__a"
+        __i=$((__i + 1))
+    done
+    printf '  %s 0)%s Back\n' "$GREEN" "$NC"
+    while :; do
+        ask __a "Choose" "0"
+        if [[ "$__a" =~ ^[0-9]+$ ]] && (( 10#$__a < __i )); then
+            printf -v "$__var" '%s' "$((10#$__a))"
+            return 0
+        fi
+        warn "Type a number from the list."
+    done
+}
+
+# ---------------------------------------------------------------- locking
+take_lock() {  # take_lock [nonblock]
+    (( DRY )) && return 0
+    mkdir -p "$(dirname "$LOCK")"
+    exec 9>"$LOCK"
+    if [[ "${1:-}" == nonblock ]]; then
+        flock -n 9 || exit 0
+    elif ! flock -w 60 9; then
+        die "Another gretun command is running (lock $LOCK)."
+    fi
+}
+
+# ---------------------------------------------------------------- addresses
+is_ipv4() {
+    local re='^([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})$'
+    [[ "$1" =~ $re ]] || return 1
+    (( 10#${BASH_REMATCH[1]} <= 255 && 10#${BASH_REMATCH[2]} <= 255 \
+        && 10#${BASH_REMATCH[3]} <= 255 && 10#${BASH_REMATCH[4]} <= 255 ))
+}
+ip2int() {
+    local a b c d
+    IFS=. read -r a b c d <<<"$1"
+    printf '%s' "$(( (10#$a << 24) | (10#$b << 16) | (10#$c << 8) | 10#$d ))"
+}
+int2ip() {
+    printf '%s.%s.%s.%s' "$(( ($1 >> 24) & 255 ))" "$(( ($1 >> 16) & 255 ))" \
+        "$(( ($1 >> 8) & 255 ))" "$(( $1 & 255 ))"
+}
+# expand6 ADDR -> 8 groups of 4 hex digits; fails on invalid input
+expand6() {
+    local a="${1,,}" left right n g
+    local -a L=() Rt=() out=()
+    a="${a#[}"
+    a="${a%]}"
+    [[ -n "$a" && "$a" =~ ^[0-9a-f:]+$ && "$a" != *:::* && "$a" != *::*::* ]] || return 1
+    if [[ "$a" == :* && "$a" != ::* ]] || [[ "$a" == *: && "$a" != *:: ]]; then return 1; fi
+    if [[ "$a" == *::* ]]; then
+        left="${a%%::*}"
+        right="${a#*::}"
+        if [[ -n "$left" ]]; then IFS=: read -ra L <<<"$left"; fi
+        if [[ -n "$right" ]]; then IFS=: read -ra Rt <<<"$right"; fi
+        n=$((8 - ${#L[@]} - ${#Rt[@]}))
+        (( n >= 1 )) || return 1
+    else
+        IFS=: read -ra L <<<"$a"
+        n=0
+        (( ${#L[@]} == 8 )) || return 1
+    fi
+    for g in "${L[@]}"; do [[ "$g" =~ ^[0-9a-f]{1,4}$ ]] || return 1; out+=("$g"); done
+    while (( n > 0 )); do out+=(0); n=$((n - 1)); done
+    for g in "${Rt[@]}"; do [[ "$g" =~ ^[0-9a-f]{1,4}$ ]] || return 1; out+=("$g"); done
+    printf '%04x:%04x:%04x:%04x:%04x:%04x:%04x:%04x' \
+        "$((16#${out[0]}))" "$((16#${out[1]}))" "$((16#${out[2]}))" "$((16#${out[3]}))" \
+        "$((16#${out[4]}))" "$((16#${out[5]}))" "$((16#${out[6]}))" "$((16#${out[7]}))"
+}
+is_ipv6() { expand6 "$1" >/dev/null; }
+# compress6 ADDR -> RFC 5952 short form
+compress6() {
+    local e i v best=-1 blen=0 cur=-1 clen=0 s=""
+    e=$(expand6 "$1") || return 1
+    local -a g
+    IFS=: read -ra g <<<"$e"
+    for i in 0 1 2 3 4 5 6 7; do
+        v=$((16#${g[i]}))
+        g[i]=$(printf '%x' "$v")
+        if (( v == 0 )); then
+            if (( cur < 0 )); then cur=$i; clen=0; fi
+            clen=$((clen + 1))
+            if (( clen > blen )); then best=$cur; blen=$clen; fi
+        else
+            cur=-1
+        fi
+    done
+    if (( blen < 2 )); then
+        (IFS=:; printf '%s' "${g[*]}")
+        return 0
+    fi
+    local right=""
+    for (( i = 0; i < best; i++ )); do s+="${g[i]}:"; done
+    for (( i = best + blen; i < 8; i++ )); do right+=":${g[i]}"; done
+    printf '%s::%s' "${s%:}" "${right#:}"
+}
+same_ip() {  # same_ip A B (IPv4 or IPv6, any notation)
+    if is_ipv4 "$1" || is_ipv4 "$2"; then [[ "$1" == "$2" ]]; return; fi
+    [[ "$(expand6 "$1" 2>/dev/null)" == "$(expand6 "$2" 2>/dev/null)" && -n "$1" ]]
+}
+norm_ip() {  # prints the canonical form of an IPv4/IPv6 address
+    if is_ipv4 "$1"; then printf '%s' "$1"; return 0; fi
+    compress6 "$1"
+}
+# cidr_norm CIDR -> network/len in canonical form; fails if invalid
+cidr_norm() {
+    local a="${1%/*}" m="${1##*/}" n mask e hex i keep
+    [[ "$1" == */* && "$m" =~ ^[0-9]{1,3}$ ]] || return 1
+    m=$((10#$m))
+    if is_ipv4 "$a"; then
+        (( m <= 32 )) || return 1
+        mask=$(( m == 0 ? 0 : (0xffffffff << (32 - m)) & 0xffffffff ))
+        n=$(( $(ip2int "$a") & mask ))
+        printf '%s/%s' "$(int2ip "$n")" "$m"
+        return 0
+    fi
+    (( m <= 128 )) || return 1
+    e=$(expand6 "$a") || return 1
+    hex="${e//:/}"
+    keep=$((m / 4))
+    local bits="${hex:0:keep}"
+    if (( m % 4 )); then
+        bits+=$(printf '%x' $(( 16#${hex:keep:1} & (0xf << (4 - m % 4)) & 0xf )))
+        keep=$((keep + 1))
+    fi
+    for (( i = keep; i < 32; i++ )); do bits+="0"; done
+    e=""
+    for (( i = 0; i < 32; i += 4 )); do e+="${bits:i:4}:"; done
+    printf '%s/%s' "$(compress6 "${e%:}")" "$m"
+}
+is_cidr4() { local c; c=$(cidr_norm "$1" 2>/dev/null) && is_ipv4 "${c%/*}"; }
+is_cidr6() { local c; c=$(cidr_norm "$1" 2>/dev/null) && [[ "${c%/*}" == *:* ]]; }
+# cidr_overlap A B: both IPv4 or both IPv6 networks that share an address
+cidr_overlap() {
+    local a="$1" b="$2" ma mb m na nb
+    [[ "$a" == */* ]] || { if is_ipv4 "$a"; then a+=/32; else a+=/128; fi; }
+    [[ "$b" == */* ]] || { if is_ipv4 "$b"; then b+=/32; else b+=/128; fi; }
+    ma="${a##*/}" mb="${b##*/}"
+    m=$(( ma < mb ? ma : mb ))
+    if is_ipv4 "${a%/*}" && is_ipv4 "${b%/*}"; then
+        na=$(cidr_norm "${a%/*}/$m") && nb=$(cidr_norm "${b%/*}/$m") || return 1
+        [[ "$na" == "$nb" ]]
+        return
+    fi
+    if [[ "$a" == *:* && "$b" == *:* ]]; then
+        na=$(cidr_norm "${a%/*}/$m") && nb=$(cidr_norm "${b%/*}/$m") || return 1
+        [[ "$na" == "$nb" ]]
+        return
+    fi
+    return 1
+}
+# split_list "a, b c" -> one item per line
+split_list() { printf '%s\n' "${1//[, ]/$'\n'}" | sed '/^$/d'; }
+
+# This server's public address of a family, as the kernel would pick it.
+detect_local() {  # detect_local 4|6
+    local probe=1.1.1.1
+    if [[ "$1" == 6 ]]; then probe=2001:4860:4860::8888; fi
+    ip "-$1" route get "$probe" 2>/dev/null \
+        | awk '{for (i = 1; i < NF; i++) if ($i == "src") { print $(i + 1); exit }}' || true
+}
+wan_if() {  # wan_if 4|6 -> interface of the default route
+    ip "-$1" route show default 2>/dev/null \
+        | awk '{for (i = 1; i < NF; i++) if ($i == "dev") { print $(i + 1); exit }}' || true
+}
+local_has_addr() {
+    local a
+    while read -r a; do
+        if same_ip "${a%/*}" "$1"; then return 0; fi
+    done < <(ip -o addr show 2>/dev/null | awk '$3 == "inet" || $3 == "inet6" {print $4}')
+    return 1
+}
+iface_exists() { [[ -n "$1" ]] && ip link show dev "$1" >/dev/null 2>&1; }
+
+# ---------------------------------------------------------------- key=value files
+# Config files are KEY=VALUE lines and are parsed, never sourced.
+declare -A C=()
+conf_load() {  # conf_load FILE -> C[...]
+    local k v
+    C=()
+    [[ -f "$1" ]] || return 1
+    while IFS='=' read -r k v || [[ -n "$k" ]]; do
+        [[ "$k" =~ ^[A-Z][A-Z0-9_]*$ ]] || continue
+        v="${v%$'\r'}"
+        v="${v#\"}"
+        v="${v%\"}"
+        C[$k]="$v"
+    done <"$1"
+}
+conf_text() {  # conf_text KEY... -> lines for keys present in C
+    local k
+    printf '%s\n' "$MARK"
+    for k in "$@"; do
+        printf '%s=%s\n' "$k" "${C[$k]:-}"
+    done
+}
+cget() { printf '%s' "${C[$1]:-${2:-}}"; }
+conf_val() {  # conf_val FILE KEY [default]: one value without touching C
+    local v
+    v=$(awk -F= -v k="$2" '$1 == k { sub(/^[^=]*=/, ""); gsub(/^"|"$/, ""); print; exit }' "$1" 2>/dev/null)
+    printf '%s' "${v:-${3:-}}"
+}
+
+# ---------------------------------------------------------------- packages
+APT_UPDATED=0
+apt_install() {
+    (( HEAL_MODE )) && return 1
+    if (( ! APT_UPDATED )); then
+        info "Updating package lists (apt)..."
+        run apt-get update -q || warn "apt-get update failed; trying with the cached lists."
+        APT_UPDATED=1
+    fi
+    info "Installing: $*"
+    run env DEBIAN_FRONTEND=noninteractive apt-get install -y -q \
+        -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold "$@"
+}
+need() {  # need CMD:PACKAGE...
+    local item cmd pkg
+    local -a missing=()
+    for item in "$@"; do
+        cmd="${item%%:*}"
+        pkg="${item#*:}"
+        have "$cmd" || missing+=("$pkg")
+    done
+    (( ${#missing[@]} )) || return 0
+    if (( HEAL_MODE )); then return 1; fi
+    apt_install "${missing[@]}" >/dev/null || die "Could not install: ${missing[*]} (see README: offline install)."
+}
+need_base() {
+    need ip:iproute2 ss:iproute2 ping:iputils-ping modprobe:kmod nft:nftables \
+        ethtool:ethtool flock:util-linux awk:mawk
+}
+
+# ---------------------------------------------------------------- systemd
+svc() {
+    if (( TEST_MODE )); then return 0; fi
+    systemctl "$@" 9>&-
+}
+svc_active() {
+    if (( TEST_MODE )); then test_daemon_active "$1"; return; fi
+    systemctl is-active --quiet "$1" 2>/dev/null
+}
+svc_enabled() { (( ! TEST_MODE )) && systemctl is-enabled --quiet "$1" 2>/dev/null; }
+unit_exists() {
+    (( TEST_MODE )) && return 1
+    [[ -n "$(systemctl list-unit-files --no-legend "$1" 2>/dev/null)" ]]
+}
+daemon_reload() { if (( ! TEST_MODE )); then run systemctl daemon-reload; fi; }
+
+# In test mode haproxy and the UDP nginx are run directly (no systemd).
+test_pidfile() { printf '%s/%s.pid' "$RUNDIR" "$1"; }
+test_daemon_active() {
+    local p
+    p=$(cat "$(test_pidfile "$1")" 2>/dev/null) || return 1
+    [[ -n "$p" ]] && kill -0 "$p" 2>/dev/null
+}
+test_daemon() {  # test_daemon start|reload|stop UNIT
+    local pf
+    pf=$(test_pidfile "$2")
+    mkdir -p "$RUNDIR"
+    case "$1:$2" in
+        start:haproxy|reload:haproxy)
+            if test_daemon_active haproxy; then
+                haproxy -D -f "$HAPROXY_CFG" -p "$pf" -sf "$(cat "$pf")"
+            else
+                haproxy -D -f "$HAPROXY_CFG" -p "$pf"
+            fi ;;
+        start:"$UDP_UNIT")
+            if test_daemon_active "$2"; then kill -HUP "$(cat "$pf")"; return 0; fi
+            setsid nginx -c "$UDP_CFG" >/dev/null 2>&1 &
+            printf '%s\n' "$!" >"$pf"
+            sleep 0.5 ;;
+        reload:"$UDP_UNIT") kill -HUP "$(cat "$pf")" ;;
+        stop:*)
+            if test_daemon_active "$2"; then
+                if [[ "$2" == haproxy ]]; then
+                    kill "$(cat "$pf")"
+                else
+                    kill -QUIT "$(cat "$pf")"
+                fi
+            fi
+            rm -f "$pf" ;;
+    esac
+}
+
+# ---------------------------------------------------------------- sysctl
+sysctl_get() { local v; v=$(sysctl -n "$1" 2>/dev/null) || return 1; printf '%s' "${v//$'\t'/ }"; }
+sysctl_set() {  # sysctl_set KEY VALUE (runtime; the old value is kept for rollback)
+    local cur
+    cur=$(sysctl_get "$1") || return 1
+    [[ "$cur" == "$2" ]] && return 0
+    rb_note_sysctl "$1" "$cur"
+    run sysctl -q -w "$1=$2" >/dev/null
+}
+
+# ---------------------------------------------------------------- rollback
+# A pending change keeps a snapshot of gretun's files, the old values of every
+# sysctl it changed, copies of foreign files it edited and undo commands.
+# A systemd-run timer restores all of it unless "gretun confirm" runs first.
+RB_ACTIVE=0
+RB_PENDING="$RB_DIR/pending"
+RB_SNAP_PATHS=(etc/gretun/tunnels etc/gretun/pg etc/gretun/exit etc/gretun/gretun.conf
+    var/lib/gretun/owned etc/sysctl.d/90-gretun-forward.conf etc/udev/rules.d/90-gretun-offload.rules)
+
+rb_pending() { [[ -d "$RB_PENDING" ]]; }
+NO_RB=0
+rb_begin() {  # rb_begin "label"
+    local p
+    (( NO_RB )) && return 0
+    if rb_pending; then
+        die "A change is still waiting for confirmation ($(cat "$RB_PENDING/label" 2>/dev/null)). Run 'gretun confirm' or 'gretun rollback' first."
+    fi
+    if (( DRY )); then
+        printf '%s[dry-run]%s rollback snapshot: %s\n' "$DIM" "$NC" "$1"
+        RB_ACTIVE=1
+        return 0
+    fi
+    mkdir -p "$RB_PENDING/files"
+    printf '%s\n' "$1" >"$RB_PENDING/label"
+    : >"$RB_PENDING/sysctl.prev"
+    : >"$RB_PENDING/undo"
+    : >"$RB_PENDING/absent"
+    local -a present=()
+    for p in "${RB_SNAP_PATHS[@]}"; do
+        if [[ -e "$R/$p" ]]; then present+=("$p"); else printf '%s\n' "$p" >>"$RB_PENDING/absent"; fi
+    done
+    if (( ${#present[@]} )); then
+        tar -C "${R:-/}" -czf "$RB_PENDING/snapshot.tgz" "${present[@]}"
+    fi
+    RB_ACTIVE=1
+    jlog "rollback snapshot taken: $1"
+}
+rb_note_sysctl() {
+    (( RB_ACTIVE && ! DRY )) || return 0
+    grep -q "^$1=" "$RB_PENDING/sysctl.prev" 2>/dev/null || printf '%s=%s\n' "$1" "$2" >>"$RB_PENDING/sysctl.prev"
+}
+rb_save_file() {  # rb_save_file PATH: restored as it is now
+    (( RB_ACTIVE && ! DRY )) || return 0
+    local n
+    n=$(find "$RB_PENDING/files" -maxdepth 1 -type f -name '*.file' | wc -l)
+    if [[ -e "$1" ]]; then
+        cp -a "$1" "$RB_PENDING/files/$n.file"
+        printf 'restore %s %s\n' "$n" "$1" >>"$RB_PENDING/files/index"
+    else
+        : >"$RB_PENDING/files/$n.file"
+        printf 'remove %s %s\n' "$n" "$1" >>"$RB_PENDING/files/index"
+    fi
+}
+rb_undo() {  # rb_undo CMD...: run (in reverse order) on rollback
+    (( RB_ACTIVE && ! DRY )) || return 0
+    { printf '%q ' "$@"; printf '\n'; } >>"$RB_PENDING/undo"
+}
+rb_arm() {  # rb_arm DEFAULT_SECONDS: starts the timer, then asks to confirm
+    local secs="${RB_SECS:-$1}" a=""
+    (( RB_ACTIVE )) || return 0
+    RB_ACTIVE=0
+    if (( DRY )); then
+        printf '%s[dry-run]%s rollback timer %ss\n' "$DIM" "$NC" "$secs"
+        return 0
+    fi
+    if (( TEST_MODE )); then
+        setsid bash -c "sleep $secs; exec \"\$0\" rollback --fire" "$SELF" >/dev/null 2>&1 &
+        printf '%s\n' "$!" >"$RB_PENDING/timer.pid"
+    else
+        systemctl stop gretun-rollback.timer >/dev/null 2>&1 || true
+        systemctl reset-failed gretun-rollback.service gretun-rollback.timer >/dev/null 2>&1 || true
+        systemd-run --quiet --unit gretun-rollback --on-active="${secs}s" \
+            --timer-property=AccuracySec=1s "$SELF" rollback --fire \
+            || die "Could not start the rollback timer; nothing is kept."
+    fi
+    printf '%s\n' "$(( $(date +%s) + secs ))" >"$RB_PENDING/deadline"
+    printf '\n%sSafety timer:%s this change is undone automatically in %ss.\n' "$YELLOW$BOLD" "$NC" "$secs"
+    if (( AUTO_CONFIRM )); then
+        rb_confirm
+        return 0
+    fi
+    if (( HAVE_TTY && ! ASSUME_YES )); then
+        printf 'Check that everything works (SSH, clients, the other server), then type %syes%s to keep it.\n' "$BOLD" "$NC"
+        read -r -t "$secs" -p "Keep this change? " a </dev/tty || true
+        if [[ "$a" == [yY]* ]]; then
+            rb_confirm
+        else
+            warn "Not confirmed. Rolling back now..."
+            rb_fire
+        fi
+    else
+        printf 'Run %sgretun confirm%s within %ss to keep it, or %sgretun rollback%s to undo now.\n' \
+            "$BOLD" "$NC" "$secs" "$BOLD" "$NC"
+    fi
+}
+rb_stop_timer() {
+    if (( TEST_MODE )); then
+        kill "$(cat "$RB_PENDING/timer.pid" 2>/dev/null)" 2>/dev/null || true
+    else
+        systemctl stop gretun-rollback.timer >/dev/null 2>&1 || true
+    fi
+}
+rb_confirm() {
+    rb_pending || { info "Nothing is waiting for confirmation."; return 0; }
+    (( DRY )) && { printf '%s[dry-run]%s confirm\n' "$DIM" "$NC"; return 0; }
+    rb_stop_timer
+    ok "Confirmed: $(cat "$RB_PENDING/label" 2>/dev/null). The change is kept."
+    rm -rf "$RB_PENDING"
+}
+rb_fire() {
+    local kind n path line k v
+    rb_pending || { info "Nothing to roll back."; return 0; }
+    (( DRY )) && { printf '%s[dry-run]%s rollback\n' "$DIM" "$NC"; return 0; }
+    rb_stop_timer
+    warn "Rolling back: $(cat "$RB_PENDING/label" 2>/dev/null)"
+    if [[ -s "$RB_PENDING/undo" ]]; then
+        tac "$RB_PENDING/undo" | while read -r line; do
+            eval "$line" >/dev/null 2>&1 || true
+        done
+    fi
+    while read -r path; do rm -rf -- "$R/${path:?}"; done <"$RB_PENDING/absent"
+    for path in "${RB_SNAP_PATHS[@]}"; do
+        if [[ -d "$R/$path" ]]; then rm -rf -- "$R/${path:?}"; fi
+    done
+    if [[ -f "$RB_PENDING/snapshot.tgz" ]]; then
+        tar -C "${R:-/}" -xzf "$RB_PENDING/snapshot.tgz"
+    fi
+    if [[ -f "$RB_PENDING/files/index" ]]; then
+        while read -r kind n path; do
+            if [[ "$kind" == restore ]]; then cp -a "$RB_PENDING/files/$n.file" "$path"; else rm -f "$path"; fi
+        done <"$RB_PENDING/files/index"
+    fi
+    sync_all quiet || true
+    # Old sysctl values last: forwarding off only after the NAT/routes are gone,
+    # accept_ra back only after forwarding.
+    if [[ -s "$RB_PENDING/sysctl.prev" ]]; then
+        tac "$RB_PENDING/sysctl.prev" | while IFS='=' read -r k v; do
+            sysctl -q -w "$k=$v" >/dev/null 2>&1 || true
+        done
+    fi
+    if [[ -f "$RB_PENDING/restart" ]]; then
+        while read -r line; do eval "$line" >/dev/null 2>&1 || true; done <"$RB_PENDING/restart"
+    fi
+    rm -rf "$RB_PENDING"
+    alert "Change rolled back on $(hostname)" || true
+    ok "Rollback finished."
+}
+rb_after() {  # rb_after CMD...: run after files are restored on rollback (e.g. restart a node)
+    (( RB_ACTIVE && ! DRY )) || return 0
+    { printf '%q ' "$@"; printf '\n'; } >>"$RB_PENDING/restart"
+}
+
+# ======================================================================
+# Section 1: GRE tunnels
+# ======================================================================
+# One file per tunnel in /etc/gretun/tunnels/<name>.conf:
+#   NAME FAMILY(4|6) ROLE(iran|foreign) LOCAL REMOTE MTU
+#   IN4_LOCAL IN4_PEER IN4_PREFIX IN6_LOCAL IN6_PEER ORIGIN
+TUN_KEYS=(NAME FAMILY ROLE LOCAL REMOTE MTU IN4_LOCAL IN4_PEER IN4_PREFIX IN6_LOCAL IN6_PEER ORIGIN)
+
+tun_list() {
+    local f
+    for f in "$TUN_DIR"/*.conf; do f="${f##*/}"; printf '%s\n' "${f%.conf}"; done
+}
+tun_load() { conf_load "$TUN_DIR/$1.conf"; }
+tun_save() { write_file "$TUN_DIR/${C[NAME]}.conf" 640 "$(conf_text "${TUN_KEYS[@]}")" || true; }
+default_mtu() { if [[ "$1" == 6 ]]; then printf 1450; else printf 1476; fi; }
+max_mtu() { if [[ "$1" == 6 ]]; then printf 1456; else printf 1476; fi; }
+valid_name() { [[ "$1" =~ ^[a-zA-Z][a-zA-Z0-9_]{0,14}$ ]]; }
+
+owned_has() { grep -qx -- "$1" "$OWNED" 2>/dev/null; }
+owned_add() {
+    owned_has "$1" && return 0
+    (( DRY )) && return 0
+    mkdir -p "$STATE"
+    printf '%s\n' "$1" >>"$OWNED"
+}
+owned_del() {
+    (( DRY )) && return 0
+    [[ -f "$OWNED" ]] || return 0
+    local tmp
+    tmp=$(grep -vx -- "$1" "$OWNED" || true)
+    printf '%s\n' "$tmp" | sed '/^$/d' >"$OWNED"
+}
+
+next_tun_name() {
+    local i=1
+    while [[ -f "$TUN_DIR/gre$i.conf" ]] || iface_exists "gre$i"; do i=$((i + 1)); done
+    printf 'gre%s' "$i"
+}
+
+# Every IPv4/IPv6 prefix that is already used on this server or configured.
+used_prefixes() {  # used_prefixes 4|6
+    local f v k
+    ip "-$1" -o addr show 2>/dev/null | awk '{print $4}'
+    ip "-$1" route show table all 2>/dev/null | awk '
+        { d = $1; if (d ~ /^(local|broadcast|unicast|anycast|multicast|blackhole|unreachable|prohibit|throw|nat)$/) d = $2
+          if (d != "default" && d !~ /^(fe80|ff)/) print d }'
+    for f in "$PG_DIR"/*.conf "$EXIT_DIR"/*.conf; do
+        conf_load "$f" || continue
+        for v in $(split_list "$(cget "V$1_SUBNETS")"); do printf '%s\n' "$v"; done
+    done
+    for f in "$TUN_DIR"/*.conf; do
+        conf_load "$f" || continue
+        k=IN4_LOCAL
+        if [[ "$1" == 6 ]]; then k=IN6_LOCAL; fi
+        [[ -n "$(cget "$k")" ]] && printf '%s/%s\n' "$(cget "$k")" "$( [[ $1 == 6 ]] && echo 64 || cget IN4_PREFIX 30)"
+    done
+    C=()
+}
+prefix_free() {  # prefix_free CIDR
+    local fam=4 p
+    if [[ "$1" == *:* ]]; then fam=6; fi
+    while read -r p; do
+        [[ -n "$p" ]] || continue
+        if cidr_overlap "$1" "$p"; then return 1; fi
+    done < <(used_prefixes "$fam" | sort -u)
+    return 0
+}
+# A random 10.X.Y.0/30 so tunnels to several foreign servers never collide.
+alloc_net4() {
+    local i net
+    for i in $(seq 1 100); do
+        net="10.$((RANDOM % 245 + 10)).$((RANDOM % 254 + 1)).0/30"
+        if prefix_free "$net" && prefix_free "$(ula_prefix "$net")"; then
+            printf '%s' "$net"
+            return 0
+        fi
+        : "$i"
+    done
+    die "Could not find a free 10.x.y.0/30 network for the tunnel."
+}
+# The inner IPv6 /64 follows from the inner IPv4 network, so both servers
+# (and tunnels imported from the old scripts) derive the same one.
+ula_prefix() {  # ula_prefix A.B.C.D/P -> fd47:4752:XXXX:XXXX::/64
+    local n
+    n=$(ip2int "$(cidr_norm "$1" | cut -d/ -f1)")
+    printf '%s/64' "$(compress6 "$(printf '%s:%x:%x::' "$ULA_BASE" "$(( n >> 16 ))" "$(( n & 0xffff ))")")"
+}
+ula_host() {  # ula_host PREFIX/64 N
+    compress6 "${1%::/64}::$2"
+}
+# fill_inner ROLE NET4: IN4_* and IN6_* in C (Iran .1/::1, foreign .2/::2)
+fill_inner() {
+    local role="$1" net="$2" n base p6
+    n=$(cidr_norm "$net") || die "Invalid tunnel network: $net"
+    base=$(ip2int "${n%/*}")
+    p6=$(ula_prefix "$n")
+    if [[ "$role" == iran ]]; then
+        C[IN4_LOCAL]=$(int2ip $((base + 1))) C[IN4_PEER]=$(int2ip $((base + 2)))
+        C[IN6_LOCAL]=$(ula_host "$p6" 1) C[IN6_PEER]=$(ula_host "$p6" 2)
+    else
+        C[IN4_LOCAL]=$(int2ip $((base + 2))) C[IN4_PEER]=$(int2ip $((base + 1)))
+        C[IN6_LOCAL]=$(ula_host "$p6" 2) C[IN6_PEER]=$(ula_host "$p6" 1)
+    fi
+    C[IN4_PREFIX]=30
+}
+norm_tun_net() {  # accepts 10.X.Y, 10.X.Y.0, 10.X.Y.0/30, any A.B.C.D/30
+    local s="${1//[[:space:]]/}"
+    if [[ "$s" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then s="$s.0"; fi
+    if [[ "$s" != */* ]]; then s="$s/30"; fi
+    is_cidr4 "$s" && [[ "${s#*/}" == 30 ]] || return 1
+    cidr_norm "$s"
+}
+
+# ---------------------------------------------------------------- connection key
+b64u_enc() { base64 -w0 | tr '/+' '_-' | tr -d '='; }
+b64u_dec() {
+    local s="$1" pad
+    [[ "$s" =~ ^[A-Za-z0-9_-]+$ ]] || return 1
+    s=$(printf '%s' "$s" | tr '_-' '/+')
+    pad=$(( (4 - ${#s} % 4) % 4 ))
+    s+=$(printf '%*s' "$pad" '' | tr ' ' '=')
+    printf '%s' "$s" | base64 -d 2>/dev/null
+}
+crc() { printf '%s' "$1" | cksum | awk '{print $1}'; }
+# gretun://b64url("v2|FAMILY|IRAN|FOREIGN|NET4|MTU|CRC"), seen from the Iran side
+key_for() {  # key_for NAME (a foreign-side tunnel)
+    local body
+    tun_load "$1" || return 1
+    body="v2|${C[FAMILY]}|${C[REMOTE]}|${C[LOCAL]}|$(cidr_norm "${C[IN4_PEER]}/${C[IN4_PREFIX]}")|${C[MTU]}"
+    printf '%s%s' "$KEY_PREFIX" "$(printf '%s|%s' "$body" "$(crc "$body")" | b64u_enc)"
+}
+K_FAMILY="" K_IRAN="" K_FOREIGN="" K_NET="" K_MTU=""
+key_decode() {
+    local s="${1//[[:space:]]/}" raw v a b c d e f g
+    if [[ "$s" == "$LEGACY_KEY_PREFIX"* ]]; then
+        # Key of HAProxy-GRE6.sh: v1|IRAN6|FOREIGN6|10.X.Y|MTU|CRC
+        raw=$(b64u_dec "${s#"$LEGACY_KEY_PREFIX"}") || return 1
+        IFS='|' read -r v a b c d e f <<<"$raw"
+        [[ "$v" == v1 && -z "$f" && "$e" == "$(crc "v1|$a|$b|$c|$d")" ]] || return 1
+        K_FAMILY=6 K_IRAN="$a" K_FOREIGN="$b" K_MTU="$d"
+        K_NET=$(norm_tun_net "$c") || return 1
+    else
+        raw=$(b64u_dec "${s#"$KEY_PREFIX"}") || return 1
+        IFS='|' read -r v a b c d e f g <<<"$raw"
+        [[ "$v" == v2 && -z "$g" && "$f" == "$(crc "v2|$a|$b|$c|$d|$e")" ]] || return 1
+        K_FAMILY="$a" K_IRAN="$b" K_FOREIGN="$c" K_MTU="$e"
+        K_NET=$(norm_tun_net "$d") || return 1
+    fi
+    [[ "$K_FAMILY" == 4 || "$K_FAMILY" == 6 ]] || return 1
+    [[ "$K_MTU" =~ ^[0-9]{4}$ ]] || return 1
+    if [[ "$K_FAMILY" == 6 ]]; then
+        is_ipv6 "$K_IRAN" && is_ipv6 "$K_FOREIGN" || return 1
+    else
+        is_ipv4 "$K_IRAN" && is_ipv4 "$K_FOREIGN" || return 1
+    fi
+}
+
+# ---------------------------------------------------------------- interfaces
+LI_KIND="" LI_LOCAL="" LI_REMOTE="" LI_MTU="" LI_UP=0
+link_info() {
+    local line re='[<,]UP[,>]'
+    line=$(ip -d -o link show dev "$1" 2>/dev/null) || return 1
+    LI_UP=0
+    if [[ "$line" =~ $re ]]; then LI_UP=1; fi
+    LI_MTU=$(awk '{for (i = 1; i < NF; i++) if ($i == "mtu") { print $(i + 1); exit }}' <<<"$line")
+    read -r LI_KIND LI_REMOTE LI_LOCAL < <(awk '{
+        for (i = 2; i < NF; i++) if ($i == "remote" && ($(i-1) == "gre" || $(i-1) == "ip6gre")) {
+            k = $(i-1); r = $(i+1); l = "any"
+            for (j = i; j < NF; j++) if ($j == "local") { l = $(j+1); break }
+            print k, r, l; exit } }' <<<"$line") || true
+}
+has_addr() {  # has_addr IFACE ADDR
+    local a
+    while read -r a; do
+        if same_ip "${a%/*}" "$2"; then return 0; fi
+    done < <(ip -o addr show dev "$1" 2>/dev/null | awk '{print $4}')
+    return 1
+}
+offload_apply() {  # gso/gro/tso off on one interface (never on a physical NIC)
+    local cur f
+    have ethtool && iface_exists "$1" || return 0
+    cur=$(ethtool -k "$1" 2>/dev/null) || return 0
+    for f in generic-segmentation-offload:gso generic-receive-offload:gro tcp-segmentation-offload:tso; do
+        if grep -q "^${f%%:*}: on" <<<"$cur"; then
+            run ethtool -K "$1" "${f#*:}" off >/dev/null 2>&1 || true
+        fi
+    done
+}
+offload_state() {  # prints "gso=off gro=off tso=off"
+    local cur
+    cur=$(ethtool -k "$1" 2>/dev/null) || { printf 'unknown'; return 0; }
+    awk -F': ' '/^generic-segmentation-offload:/ {g=$2} /^generic-receive-offload:/ {r=$2}
+        /^tcp-segmentation-offload:/ {t=$2}
+        END {sub(/ .*/, "", g); sub(/ .*/, "", r); sub(/ .*/, "", t); printf "gso=%s gro=%s tso=%s", g, r, t}' <<<"$cur"
+}
+
+# tunnel_ensure NAME [recreate]: brings one tunnel to its configured state
+# without touching it when it already matches (no downtime on import/heal).
+tunnel_ensure() {
+    local n="$1" kind=gre want_local want_remote
+    tun_load "$n" || { err "No configuration for tunnel $n."; return 1; }
+    if [[ "${C[FAMILY]}" == 6 ]]; then kind=ip6gre; fi
+    want_local="${C[LOCAL]}" want_remote="${C[REMOTE]}"
+    quiet modprobe "$( [[ $kind == ip6gre ]] && echo ip6_gre || echo ip_gre )" || true
+    if iface_exists "$n"; then
+        link_info "$n"
+        if [[ "${2:-}" == recreate || "$LI_KIND" != "$kind" ]] \
+            || ! same_ip "$LI_LOCAL" "$want_local" || ! same_ip "$LI_REMOTE" "$want_remote"; then
+            if ! owned_has "$n"; then
+                err "Interface $n exists with other settings and was not created by gretun; not touching it."
+                return 1
+            fi
+            info "Recreating $n..."
+            run ip link del "$n"
+        fi
+    fi
+    if ! iface_exists "$n"; then
+        if [[ "$kind" == gre ]]; then
+            run ip tunnel add "$n" mode gre local "$want_local" remote "$want_remote" ttl 255 \
+                || { err "Could not create $n."; return 1; }
+        else
+            run ip link add "$n" type ip6gre local "$want_local" remote "$want_remote" ttl 255 encaplimit none \
+                || { err "Could not create $n (is the ip6_gre module available? OpenVZ/LXC often lack it)."; return 1; }
+        fi
+    fi
+    owned_add "$n"
+    if (( DRY )) && ! iface_exists "$n"; then return 0; fi
+    link_info "$n"
+    if [[ "$LI_MTU" != "${C[MTU]}" ]]; then run ip link set dev "$n" mtu "${C[MTU]}"; fi
+    if (( ! LI_UP )); then run ip link set dev "$n" up; fi
+    sysctl_set "net/ipv6/conf/$n/disable_ipv6" 0 || true
+    # Loose reverse-path check: replies for WG clients come back on the tunnel.
+    sysctl_set "net/ipv4/conf/$n/rp_filter" 2 || true
+    if ! has_addr "$n" "${C[IN4_LOCAL]}"; then
+        run ip addr add "${C[IN4_LOCAL]}/${C[IN4_PREFIX]}" dev "$n"
+    fi
+    if [[ -n "${C[IN6_LOCAL]:-}" ]] && ! has_addr "$n" "${C[IN6_LOCAL]}"; then
+        run ip -6 addr add "${C[IN6_LOCAL]}/64" dev "$n" nodad
+    fi
+    offload_apply "$n"
+}
+tunnel_delete_iface() {
+    if iface_exists "$1" && owned_has "$1"; then run ip link del "$1"; fi
+    owned_del "$1"
+}
+
+# ---------------------------------------------------------------- ping/status
+PING_RTT="" PING_LOSS=""
+ping_peer() {  # ping_peer ADDR [count]: sets PING_RTT (ms) and PING_LOSS (%)
+    local out fam=4
+    if [[ "$1" == *:* ]]; then fam=6; fi
+    PING_RTT="-" PING_LOSS="100"
+    [[ -n "$1" ]] || return 1
+    out=$(ping "-$fam" -n -q -c "${2:-3}" -W 2 -i 0.3 "$1" 2>/dev/null) || true
+    PING_LOSS=$(awk -F', ' '/packet loss/ {for (i = 1; i <= NF; i++) if ($i ~ /packet loss/) {sub(/%.*/, "", $i); print $i}}' <<<"$out")
+    PING_RTT=$(awk -F'/' '/^rtt|^round-trip/ {print $5}' <<<"$out")
+    PING_LOSS="${PING_LOSS:-100}" PING_RTT="${PING_RTT:--}"
+    [[ "$PING_RTT" != "-" ]]
+}
+fmt_bytes() {
+    awk -v b="${1:-0}" 'BEGIN { split("B KB MB GB TB PB", u, " "); i = 1
+        while (b >= 1024 && i < 6) { b /= 1024; i++ } printf (i == 1 ? "%d %s" : "%.1f %s"), b, u[i] }'
+}
+iface_bytes() {  # prints "<rx> <tx>"
+    printf '%s %s' "$(cat "/sys/class/net/$1/statistics/rx_bytes" 2>/dev/null || echo 0)" \
+        "$(cat "/sys/class/net/$1/statistics/tx_bytes" 2>/dev/null || echo 0)"
+}
+tunnel_status() {  # tunnel_status [NAME]
+    local n rx tx st v4 v6
+    local -a names=()
+    if [[ -n "${1:-}" ]]; then names=("$1"); else mapfile -t names < <(tun_list); fi
+    if (( ${#names[@]} == 0 )); then info "No tunnels yet."; return 0; fi
+    printf '%s%-10s %-7s %-8s %-4s %-30s %-16s %-16s %s%s\n' "$BOLD" NAME ROLE STATE FAM "LOCAL -> REMOTE" "PING v4" "PING v6" "RX / TX" "$NC"
+    for n in "${names[@]}"; do
+        tun_load "$n" || { warn "Unknown tunnel: $n"; continue; }
+        st="${RED}missing${NC}" v4="-" v6="-" rx=0 tx=0
+        if iface_exists "$n"; then
+            link_info "$n"
+            if (( LI_UP )); then st="${GREEN}up${NC}"; else st="${YELLOW}down${NC}"; fi
+            if ping_peer "${C[IN4_PEER]}"; then v4="${PING_RTT}ms ${PING_LOSS}%"; else v4="${RED}no reply${NC}"; fi
+            if [[ -n "${C[IN6_PEER]:-}" ]]; then
+                if ping_peer "${C[IN6_PEER]}"; then v6="${PING_RTT}ms ${PING_LOSS}%"; else v6="${RED}no reply${NC}"; fi
+            fi
+            read -r rx tx <<<"$(iface_bytes "$n")"
+        fi
+        printf '%-10s %-7s %-19s %-4s %-30s %-27s %-27s %s / %s\n' "$n" "${C[ROLE]}" "$st" "v${C[FAMILY]}" \
+            "${C[LOCAL]} -> ${C[REMOTE]}" "$v4" "$v6" "$(fmt_bytes "$rx")" "$(fmt_bytes "$tx")"
+        printf '           inner %s <-> %s   %s <-> %s   mtu %s\n' "${C[IN4_LOCAL]}" "${C[IN4_PEER]}" \
+            "${C[IN6_LOCAL]:--}" "${C[IN6_PEER]:--}" "${C[MTU]}"
+    done
+}
+
+# ---------------------------------------------------------------- firewall
+ufw_active() { have ufw && ufw status 2>/dev/null | grep -q '^Status: active'; }
+ufw_gre() {  # ufw_gre allow|delete PEER
+    ufw_active || return 0
+    if [[ "$1" == allow ]]; then
+        run ufw allow proto gre from "$2" comment gretun >/dev/null 2>&1 \
+            || warn "ufw did not accept a GRE rule; gretun's own iptables chain still allows it."
+    else
+        run ufw delete allow proto gre from "$2" comment gretun >/dev/null 2>&1 || true
+    fi
+}
+ipt_jump() {  # ipt_jump add|del CMD PARENT CHAIN
+    local cmd="$2"
+    have "$cmd" || return 0
+    if [[ "$1" == add ]]; then
+        "$cmd" -w 5 -C "$3" -m comment --comment gretun -j "$4" >/dev/null 2>&1 \
+            || run "$cmd" -w 5 -I "$3" 1 -m comment --comment gretun -j "$4"
+    else
+        while "$cmd" -w 5 -C "$3" -m comment --comment gretun -j "$4" >/dev/null 2>&1; do
+            run "$cmd" -w 5 -D "$3" -m comment --comment gretun -j "$4" || break
+            (( DRY )) && break
+        done
+    fi
+}
+ipt_apply() {  # ipt_apply iptables|ip6tables RULES_TEXT ("" = remove gretun chains)
+    local cmd="$1" body="$2" restore="${1}-restore" last="$RUNDIR/$1.applied"
+    have "$cmd" && have "$restore" || return 0
+    "$cmd" -w 5 -L INPUT -n >/dev/null 2>&1 || return 0
+    if [[ -z "$body" ]]; then
+        ipt_jump del "$cmd" INPUT GRETUN-IN
+        ipt_jump del "$cmd" FORWARD GRETUN-FWD
+        local ch
+        for ch in GRETUN-IN GRETUN-FWD; do
+            if "$cmd" -w 5 -L "$ch" -n >/dev/null 2>&1; then
+                run "$cmd" -w 5 -F "$ch"
+                run "$cmd" -w 5 -X "$ch"
+            fi
+        done
+        rm -f "$last"
+        return 0
+    fi
+    local text
+    text=$(printf '*filter\n:GRETUN-IN - [0:0]\n:GRETUN-FWD - [0:0]\n%sCOMMIT\n' "$body")
+    if [[ ! -f "$last" || "$(cat "$last")" != "$text" ]] || ! "$cmd" -w 5 -L GRETUN-IN -n >/dev/null 2>&1; then
+        # Declaring our chains in --noflush mode replaces only their contents, atomically.
+        printf '%s\n' "$text" | run_in "$restore" -w 5 --noflush || { warn "$restore failed."; return 1; }
+        if (( ! DRY )); then mkdir -p "$RUNDIR"; printf '%s' "$text" >"$last"; fi
+    fi
+    ipt_jump add "$cmd" INPUT GRETUN-IN
+    ipt_jump add "$cmd" FORWARD GRETUN-FWD
+}
+nft_set() {  # nft_set item... -> { "a", "b" } or a single item
+    local out="" i q='"'
+    for i in "$@"; do
+        if [[ "$i" == [0-9]* || "$i" == *:* ]]; then out+="$i, "; else out+="$q$i$q, "; fi
+    done
+    out="${out%, }"
+    if (( $# > 1 )); then printf '{ %s }' "$out"; else printf '%s' "$out"; fi
+}
+# Rebuilds gretun's firewall pieces from the configuration:
+#   inet gretun      GRE from peers + tunnel traffic accepted, MSS clamping
+#   ip/ip6 gretun_nat MASQUERADE on the foreign (exit) server
+#   GRETUN-IN/-FWD   the same accepts for iptables/ufw/docker setups
+fw_sync() {
+    local f n t wan4 wan6 nl=$'\n' s
+    local -a peers4=() peers6=() tuns=() fwd=() nat4=() nat6=() pg_ifs=()
+    local ipt4="" ipt6=""
+    for n in $(tun_list); do
+        tun_load "$n" || continue
+        tuns+=("$n")
+        if [[ "${C[FAMILY]}" == 4 ]]; then
+            peers4+=("${C[REMOTE]}")
+            ipt4+="-A GRETUN-IN -s ${C[REMOTE]}/32 -p 47 -m comment --comment gretun -j ACCEPT$nl"
+        else
+            peers6+=("${C[REMOTE]}")
+            ipt6+="-A GRETUN-IN -s ${C[REMOTE]}/128 -p 47 -m comment --comment gretun -j ACCEPT$nl"
+        fi
+        ipt4+="-A GRETUN-IN -i $n -m comment --comment gretun -j ACCEPT$nl"
+        ipt6+="-A GRETUN-IN -i $n -m comment --comment gretun -j ACCEPT$nl"
+    done
+    for f in "$PG_DIR"/*.conf; do
+        conf_load "$f" || continue
+        fwd+=("$(cget WG_IF wg0) $(cget TUNNEL)" "$(cget TUNNEL) $(cget WG_IF wg0)")
+        pg_ifs+=("$(cget WG_IF wg0)")
+    done
+    for f in "$EXIT_DIR"/*.conf; do
+        conf_load "$f" || continue
+        t=$(cget TUNNEL)
+        wan4=$(cget WAN4 auto) wan6=$(cget WAN6 auto)
+        if [[ "$wan4" == auto ]]; then wan4=$(wan_if 4); fi
+        if [[ "$wan6" == auto ]]; then wan6=$(wan_if 6); fi
+        local subs4 subs6
+        subs4=$(cget V4_SUBNETS) subs6=$(cget V6_SUBNETS)
+        tun_load "$t" || continue
+        if [[ -n "$wan4" ]]; then
+            fwd+=("$t $wan4" "$wan4 $t")
+            for s in "$(cidr_norm "${C[IN4_LOCAL]}/${C[IN4_PREFIX]}")" $(split_list "$subs4"); do nat4+=("$wan4 $s"); done
+        fi
+        if [[ -n "$wan6" ]]; then
+            [[ "$wan6" == "$wan4" ]] || fwd+=("$t $wan6" "$wan6 $t")
+            for s in "$(cidr_norm "${C[IN6_LOCAL]}/64")" $(split_list "$subs6"); do nat6+=("$wan6 $s"); done
+        fi
+    done
+    C=()
+
+    # nftables
+    local rules="" text="" pair a b
+    if (( ${#peers4[@]} )); then rules+="        ip saddr $(nft_set "${peers4[@]}") ip protocol 47 accept$nl"; fi
+    if (( ${#peers6[@]} )); then rules+="        ip6 saddr $(nft_set "${peers6[@]}") meta l4proto 47 accept$nl"; fi
+    if (( ${#tuns[@]} )); then rules+="        iifname $(nft_set "${tuns[@]}") accept$nl"; fi
+    local frules=""
+    for pair in "${fwd[@]}"; do
+        read -r a b <<<"$pair"
+        frules+="        iifname \"$a\" oifname \"$b\" accept$nl"
+        ipt4+="-A GRETUN-FWD -i $a -o $b -m comment --comment gretun -j ACCEPT$nl"
+        ipt6+="-A GRETUN-FWD -i $a -o $b -m comment --comment gretun -j ACCEPT$nl"
+    done
+    if (( ${#tuns[@]} )); then
+        local ts
+        ts=$(nft_set "${tuns[@]}")
+        text+="table inet $NFT_T$nl delete table inet $NFT_T$nl"
+        text+="table inet $NFT_T {
+    chain input {
+        type filter hook input priority -5; policy accept;
+$rules    }
+    chain forward {
+        type filter hook forward priority -5; policy accept;
+$frules    }
+    chain mss {
+        type filter hook forward priority -150; policy accept;
+        oifname $ts tcp flags & (syn|rst) == syn tcp option maxseg size set rt mtu
+        iifname $ts tcp flags & (syn|rst) == syn tcp option maxseg size set rt mtu
+    }
+}$nl"
+    else
+        text+="table inet $NFT_T$nl delete table inet $NFT_T$nl"
+    fi
+    local fam list
+    for fam in ip ip6; do
+        if [[ "$fam" == ip ]]; then list=("${nat4[@]}"); else list=("${nat6[@]}"); fi
+        text+="table $fam ${NFT_T}_nat$nl delete table $fam ${NFT_T}_nat$nl"
+        if (( ${#list[@]} )); then
+            local nrules="" addr_kw=ip
+            [[ "$fam" == ip6 ]] && addr_kw=ip6
+            for pair in "${list[@]}"; do
+                read -r a b <<<"$pair"
+                nrules+="        oifname \"$a\" $addr_kw saddr $b masquerade$nl"
+            done
+            text+="table $fam ${NFT_T}_nat {
+    chain postrouting {
+        type nat hook postrouting priority 105; policy accept;
+$nrules    }
+}$nl"
+        fi
+    done
+    local last="$RUNDIR/nft.applied"
+    if (( ${#tuns[@]} == 0 && ${#nat4[@]} == 0 && ${#nat6[@]} == 0 )); then
+        local tb
+        for tb in "inet $NFT_T" "ip ${NFT_T}_nat" "ip6 ${NFT_T}_nat"; do
+            # shellcheck disable=SC2086
+            if nft list table $tb >/dev/null 2>&1; then run nft delete table $tb; fi
+        done
+        rm -f "$last"
+    elif [[ ! -f "$last" || "$(cat "$last")" != "$text" ]] || ! nft list table inet "$NFT_T" >/dev/null 2>&1; then
+        printf '%s' "$text" | run_in nft -f - || { err "nft rejected gretun's rules."; return 1; }
+        if (( ! DRY )); then mkdir -p "$RUNDIR"; printf '%s' "$text" >"$last"; fi
+    fi
+    if (( ${#tuns[@]} )); then
+        ipt_apply iptables "$ipt4"
+        ipt_apply ip6tables "$ipt6"
+    else
+        ipt_apply iptables ""
+        ipt_apply ip6tables ""
+    fi
+}
+
+# ---------------------------------------------------------------- routes/rules
+# Desired routes as "FAM|TYPE|DST|TABLE|VIA|DEV".
+routes_desired() {
+    local f t tbl wg s
+    for f in "$PG_DIR"/*.conf; do
+        conf_load "$f" || continue
+        t=$(cget TUNNEL) tbl=$(cget TABLE) wg=$(cget WG_IF wg0)
+        # The table is never empty: when the tunnel is gone, clients get
+        # "unreachable" instead of leaking out of the Iran server.
+        printf '4|unreachable|default|%s||\n6|unreachable|default|%s||\n' "$tbl" "$tbl"
+        if iface_exists "$t"; then
+            printf '4|unicast|default|%s||%s\n6|unicast|default|%s||%s\n' "$tbl" "$t" "$tbl" "$t"
+        fi
+        if iface_exists "$wg"; then
+            for s in $(split_list "$(cget V6_SUBNETS)"); do printf '6|unicast|%s|%s||%s\n' "$s" "$tbl" "$wg"; done
+        fi
+    done
+    for f in "$EXIT_DIR"/*.conf; do
+        conf_load "$f" || continue
+        t=$(cget TUNNEL)
+        local s4 s6
+        s4=$(cget V4_SUBNETS) s6=$(cget V6_SUBNETS)
+        tun_load "$t" || continue
+        iface_exists "$t" || continue
+        for s in $(split_list "$s4"); do printf '4|unicast|%s|main|%s|%s\n' "$s" "${C[IN4_PEER]}" "$t"; done
+        for s in $(split_list "$s6"); do printf '6|unicast|%s|main|%s|%s\n' "$s" "${C[IN6_PEER]}" "$t"; done
+    done
+    C=()
+}
+routes_current() {
+    local fam
+    for fam in 4 6; do
+        ip "-$fam" route show table all proto "$RT_PROTO" 2>/dev/null | awk -v F="$fam" '
+            { type = "unicast"; i = 1
+              if ($1 ~ /^(unreachable|blackhole|prohibit|throw)$/) { type = $1; i = 2 }
+              dst = $i; via = ""; dev = ""; tbl = "main"
+              for (j = i + 1; j <= NF; j++) {
+                  if ($j == "via") via = $(j + 1)
+                  if ($j == "dev") dev = $(j + 1)
+                  if ($j == "table") tbl = $(j + 1) }
+              if (type != "unicast") dev = ""
+              print F "|" type "|" dst "|" tbl "|" via "|" dev }'
+    done
+}
+route_cmd() {  # route_cmd add|del "FAM|TYPE|DST|TABLE|VIA|DEV"
+    local fam type dst tbl via dev
+    IFS='|' read -r fam type dst tbl via dev <<<"$2"
+    local -a a=(ip "-$fam" route)
+    if [[ "$1" == add ]]; then a+=(replace); else a+=(del); fi
+    if [[ "$type" != unicast ]]; then a+=("$type"); fi
+    a+=("$dst" table "$tbl")
+    if [[ -n "$via" ]]; then a+=(via "$via"); fi
+    if [[ -n "$dev" ]]; then a+=(dev "$dev"); fi
+    if [[ "$type" == unreachable ]]; then a+=(metric "$UNREACH_METRIC"); fi
+    a+=(proto "$RT_PROTO")
+    run "${a[@]}" 2>/dev/null || { [[ "$1" == del ]] || warn "Could not add route: ${a[*]}"; }
+}
+# Desired ip -6 rules as "PREF|FROM|IIF|TABLE".
+rules_desired() {
+    local f s p
+    for f in "$PG_DIR"/*.conf; do
+        conf_load "$f" || continue
+        p=$(cget PREF "$PREF_MIN")
+        for s in $(split_list "$(cget V6_SUBNETS)"); do
+            printf '%s|%s|%s|%s\n' "$p" "$s" "$(cget WG_IF wg0)" "$(cget TABLE)"
+            p=$((p + 1))
+        done
+    done
+    C=()
+}
+rules_current() {
+    ip -6 rule show 2>/dev/null | awk -v lo="$PREF_MIN" -v hi="$PREF_MAX" '
+        { p = $1; sub(/:$/, "", p); if (p + 0 < lo || p + 0 > hi) next
+          from = ""; iif = ""; tbl = ""
+          for (i = 2; i <= NF; i++) {
+              if ($i == "from") from = $(i + 1)
+              if ($i == "iif") iif = $(i + 1)
+              if ($i == "lookup" || $i == "table") tbl = $(i + 1) }
+          print p "|" from "|" iif "|" tbl }'
+}
+routes_sync() {
+    local want have_ line p from iif tbl
+    want=$(routes_desired | sort -u)
+    have_=$(routes_current | sort -u)
+    while IFS= read -r line; do
+        [[ -n "$line" ]] || continue
+        grep -qxF -- "$line" <<<"$want" || route_cmd del "$line"
+    done <<<"$have_"
+    while IFS= read -r line; do
+        [[ -n "$line" ]] || continue
+        grep -qxF -- "$line" <<<"$have_" || route_cmd add "$line"
+    done <<<"$want"
+    want=$(rules_desired | sort -u)
+    have_=$(rules_current | sort -u)
+    while IFS='|' read -r p from iif tbl; do
+        [[ -n "$p" ]] || continue
+        grep -qxF -- "$p|$from|$iif|$tbl" <<<"$want" || run ip -6 rule del pref "$p" 2>/dev/null || true
+    done <<<"$have_"
+    while IFS='|' read -r p from iif tbl; do
+        [[ -n "$p" ]] || continue
+        grep -qxF -- "$p|$from|$iif|$tbl" <<<"$have_" \
+            || run ip -6 rule add pref "$p" from "$from" iif "$iif" lookup "$tbl" \
+            || warn "Could not add ip -6 rule from $from iif $iif lookup $tbl"
+    done <<<"$want"
+}
+
+# ---------------------------------------------------------------- forwarding
+# accept_ra=2 MUST be set on the WAN before forwarding=1: with forwarding on
+# and accept_ra=1 the kernel drops RA-learned IPv6, and an ip6gre tunnel dies.
+# Interfaces with accept_ra=0 do not use RAs and are left alone.
+forwarding_enable() {
+    local ifc cur content
+    local -a ra=()
+    for ifc in $(printf '%s\n%s\n' "$(wan_if 6)" "$(wan_if 4)" | sed '/^$/d' | sort -u); do
+        [[ -e "/proc/sys/net/ipv6/conf/$ifc/accept_ra" ]] || continue
+        cur=$(sysctl_get "net/ipv6/conf/$ifc/accept_ra")
+        if [[ "$cur" == 1 || "$cur" == 2 ]]; then
+            ra+=("$ifc")
+            sysctl_set "net/ipv6/conf/$ifc/accept_ra" 2
+        fi
+    done
+    sysctl_set net.ipv4.ip_forward 1
+    sysctl_set net.ipv6.conf.all.forwarding 1
+    content="$MARK
+# Written by gretun for the PasarGuard/exit setup. accept_ra lines come first:
+# they must be applied before forwarding is switched on."
+    for ifc in "${ra[@]}"; do content+=$'\n'"net/ipv6/conf/$ifc/accept_ra = 2"; done
+    if (( ${#ra[@]} )); then content+=$'\n'"net/ipv6/conf/default/accept_ra = 2"; fi
+    content+=$'\n'"net.ipv4.ip_forward = 1"$'\n'"net.ipv6.conf.all.forwarding = 1"
+    write_file "$SYSCTL_FWD" 644 "$content" || true
+}
+forwarding_sync() {
+    local f
+    for f in "$PG_DIR"/*.conf "$EXIT_DIR"/*.conf; do
+        forwarding_enable
+        return 0
+    done
+    # No longer needed: the file goes, runtime values stay until reboot.
+    remove_file "$SYSCTL_FWD"
+}
+
+# ---------------------------------------------------------------- offload rule
+# PasarGuard re-creates wg0 on every restart, so a udev rule switches its
+# offloads off each time the interface appears (plus the heal timer).
+offload_ifaces() {
+    local f
+    for f in "$PG_DIR"/*.conf; do conf_val "$f" WG_IF wg0; echo; done
+    if conf_load "$GLOBAL_CONF"; then split_list "$(cget OFFLOAD_IFACES)"; fi
+    C=()
+}
+offload_sync() {
+    local list ifc match
+    list=$(offload_ifaces | sed '/^$/d' | sort -u)
+    if [[ -z "$list" ]]; then
+        if [[ -f "$UDEV_RULE" ]]; then
+            remove_file "$UDEV_RULE"
+            if (( ! TEST_MODE )); then run udevadm control --reload >/dev/null 2>&1 || true; fi
+        fi
+        return 0
+    fi
+    match=$(paste -sd'|' <<<"$list")
+    if write_file "$UDEV_RULE" 644 "$MARK
+ACTION==\"add|move\", SUBSYSTEM==\"net\", KERNEL==\"$match\", RUN+=\"$INSTALL_PATH offload-apply %k\""; then
+        if (( ! TEST_MODE )); then run udevadm control --reload >/dev/null 2>&1 || true; fi
+    fi
+    for ifc in $list; do offload_apply "$ifc"; done
+}
+
+# ---------------------------------------------------------------- units
+units_sync() {
+    local n any=0 f
+    for f in "$TUN_DIR"/*.conf "$PG_DIR"/*.conf "$EXIT_DIR"/*.conf; do any=1; break; done
+    if [[ -s "$RULES" ]]; then any=1; fi
+    local mods=""
+    for n in $(tun_list); do
+        tun_load "$n" || continue
+        if [[ "${C[FAMILY]}" == 6 ]]; then mods+=$'ip6_gre\n'; else mods+=$'ip_gre\n'; fi
+    done
+    C=()
+    if [[ -n "$mods" ]]; then
+        write_file "$MODULES_FILE" 644 "$MARK"$'\n'"$(sort -u <<<"$mods")" || true
+    else
+        remove_file "$MODULES_FILE"
+    fi
+    (( TEST_MODE )) && return 0
+    local changed=0
+    if (( any )); then
+        write_file "$SYSTEMD_DIR/gretun@.service" 644 "$MARK
+[Unit]
+Description=gretun GRE tunnel %i
+After=network-online.target
+Wants=network-online.target
+Before=haproxy.service $UDP_UNIT.service docker.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=$INSTALL_PATH tunnel-up %i
+ExecStop=$INSTALL_PATH tunnel-down %i
+
+[Install]
+WantedBy=multi-user.target" && changed=1
+        write_file "$SYSTEMD_DIR/gretun-heal.service" 644 "$MARK
+[Unit]
+Description=gretun: check and repair tunnels, routes, forwarder
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=$INSTALL_PATH heal" && changed=1
+        write_file "$SYSTEMD_DIR/gretun-heal.timer" 644 "$MARK
+[Unit]
+Description=gretun heal after boot and every minute
+
+[Timer]
+OnBootSec=30s
+OnUnitActiveSec=1min
+AccuracySec=5s
+
+[Install]
+WantedBy=timers.target" && changed=1
+        if (( changed )); then daemon_reload; fi
+        svc_enabled gretun-heal.timer || run systemctl enable --now gretun-heal.timer >/dev/null 2>&1 || true
+        # --no-block: the unit runs "gretun tunnel-up", which waits for our lock.
+        for n in $(tun_list); do
+            if ! svc_enabled "gretun@$n.service" || ! svc_active "gretun@$n.service"; then
+                run systemctl enable --now --no-block "gretun@$n.service" >/dev/null 2>&1 || true
+            fi
+        done
+    else
+        if [[ -f "$SYSTEMD_DIR/gretun-heal.timer" ]]; then
+            run systemctl disable --now gretun-heal.timer >/dev/null 2>&1 || true
+            remove_file "$SYSTEMD_DIR/gretun-heal.timer"
+            remove_file "$SYSTEMD_DIR/gretun-heal.service"
+            remove_file "$SYSTEMD_DIR/gretun@.service"
+            daemon_reload
+        fi
+    fi
+}
+
+# ---------------------------------------------------------------- reconcile
+# sync_all brings the kernel and units in line with /etc/gretun. It is
+# idempotent and cheap when nothing changed (used by heal every minute).
+sync_all() {
+    local n rc=0
+    if (( ! DRY )); then mkdir -p "$TUN_DIR" "$PG_DIR" "$EXIT_DIR" "$STATE" "$RUNDIR"; fi
+    for n in $(tun_list); do tunnel_ensure "$n" || rc=1; done
+    if [[ -f "$OWNED" ]]; then
+        while read -r n; do
+            [[ -n "$n" && ! -f "$TUN_DIR/$n.conf" ]] || continue
+            [[ "${1:-}" == quiet ]] || info "Removing interface $n (no longer configured)."
+            if (( ! TEST_MODE )); then run systemctl disable --now --no-block "gretun@$n.service" >/dev/null 2>&1 || true; fi
+            tunnel_delete_iface "$n"
+        done < <(cat "$OWNED")
+    fi
+    forwarding_sync
+    fw_sync || rc=1
+    offload_sync
+    routes_sync
+    units_sync
+    return "$rc"
+}
+
+# ---------------------------------------------------------------- watchdog
+alert() {  # alert "message": ntfy, if configured
+    conf_load "$ALERT_CONF" 2>/dev/null || return 0
+    local url token
+    url=$(cget NTFY_URL) token=$(cget NTFY_TOKEN)
+    C=()
+    [[ -n "$url" ]] && have curl || return 0
+    local -a h=(-H "Title: gretun $(hostname)")
+    if [[ -n "$token" ]]; then h+=(-H "Authorization: Bearer $token"); fi
+    curl -fsS -m 10 "${h[@]}" -d "$1" "$url" >/dev/null 2>&1
+}
+watchdog() {
+    local n f fails st
+    for n in $(tun_list); do
+        tun_load "$n" || continue
+        f="$RUNDIR/wd-$n"
+        read -r fails st 2>/dev/null <"$f" || { fails=0; st=up; }
+        if ping_peer "${C[IN4_PEER]}" 2; then
+            if [[ "$st" == down ]]; then
+                jlog "tunnel $n is back up"
+                alert "Tunnel $n is back up (${PING_RTT} ms)." || true
+            fi
+            printf '0 up\n' >"$f"
+            continue
+        fi
+        fails=$((fails + 1))
+        if (( fails == 3 || fails % 10 == 0 )); then
+            warn "Tunnel $n: no reply from ${C[IN4_PEER]} ($fails checks); recreating it."
+            tunnel_ensure "$n" recreate || true
+        fi
+        if (( fails == 3 )); then
+            st=down
+            alert "Tunnel $n is DOWN: no reply from ${C[IN4_PEER]}." || true
+        fi
+        printf '%s %s\n' "$fails" "$st" >"$f"
+    done
+    C=()
+}
+
+# ---------------------------------------------------------------- commands
+print_key() {  # print_key NAME
+    local key
+    key=$(key_for "$1") || die "Unknown tunnel $1."
+    if (( RAW )); then printf '%s\n' "$key"; return 0; fi
+    section "Connection key for the Iran server"
+    printf '%s%s%s\n\n' "$GREEN$BOLD" "$key" "$NC"
+    cat <<EOF
+On the Iran server run:   gretun tunnel add --key '$key'
+(or in the menu: 1) GRE tunnel -> 2) Iran server: paste a connection key)
+
+Manual values instead of the key:
+  Transport:       IPv${C[FAMILY]}
+  Iran address:    ${C[REMOTE]}
+  Foreign address: ${C[LOCAL]}
+  Tunnel network:  $(cidr_norm "${C[IN4_LOCAL]}/${C[IN4_PREFIX]}")
+  MTU:             ${C[MTU]}
+
+Inner addresses: Iran ${C[IN4_PEER]} / ${C[IN6_PEER]}  <->  this server ${C[IN4_LOCAL]} / ${C[IN6_LOCAL]}
+EOF
+}
+ask_family() {
+    local d=4
+    if [[ -n "$O_FAMILY" ]]; then
+        [[ "$O_FAMILY" == 4 || "$O_FAMILY" == 6 ]] || die "--family must be 4 or 6."
+        printf '%s' "$O_FAMILY"
+        return 0
+    fi
+    if [[ -n "$(detect_local 6)" ]]; then d=6; fi
+    local a
+    while :; do
+        ask a "Transport between the servers: 6 = IPv6 (ip6gre, MTU 1450), 4 = IPv4 (gre, MTU 1476)" "$d"
+        [[ "$a" == 4 || "$a" == 6 ]] && { printf '%s' "$a"; return 0; }
+        warn "Type 4 or 6."
+    done
+}
+ask_addr() {  # ask_addr VAR FAMILY "prompt" [default]
+    local __a
+    while :; do
+        ask __a "$3" "${4:-}"
+        if [[ "$2" == 4 ]] && is_ipv4 "$__a"; then printf -v "$1" '%s' "$__a"; return 0; fi
+        if [[ "$2" == 6 ]] && is_ipv6 "$__a"; then printf -v "$1" '%s' "$(compress6 "$__a")"; return 0; fi
+        (( ASSUME_YES || ! HAVE_TTY )) && die "Not a valid IPv$2 address: $__a"
+        warn "Not a valid IPv$2 address."
+    done
+}
+ask_mtu() {  # ask_mtu FAMILY [default]
+    local m d="${2:-$(default_mtu "$1")}" max
+    max=$(max_mtu "$1")
+    while :; do
+        if [[ -n "$O_MTU" ]]; then m="$O_MTU"; else ask m "Tunnel MTU" "$d"; fi
+        if [[ "$m" =~ ^[0-9]{4}$ ]] && (( 10#$m >= MTU_MIN && 10#$m <= max )); then printf '%s' "$((10#$m))"; return 0; fi
+        [[ -n "$O_MTU" ]] && die "MTU must be $MTU_MIN-$max for IPv$1."
+        warn "MTU must be $MTU_MIN-$max."
+    done
+}
+# create_tunnel: C must hold a complete tunnel; saves, brings up, firewalls.
+create_tunnel() {
+    local n="${C[NAME]}"
+    [[ -f "$TUN_DIR/$n.conf" ]] && die "Tunnel $n already exists."
+    local f
+    for f in $(tun_list); do
+        if same_ip "$(conf_val "$TUN_DIR/$f.conf" REMOTE)" "${C[REMOTE]}"; then
+            die "Tunnel $f already goes to ${C[REMOTE]}; remove it first or use it."
+        fi
+    done
+    tun_save
+    ufw_gre allow "${C[REMOTE]}"
+    if ! sync_all; then
+        warn "The tunnel could not be brought up; removing it again."
+        remove_file "$TUN_DIR/$n.conf"
+        sync_all quiet || true
+        return 1
+    fi
+    ok "Tunnel $n created."
+}
+cmd_tunnel_add() {
+    legacy_guard
+    need_base
+    if [[ -n "$O_KEY" ]]; then tunnel_add_iran_key "$O_KEY"; return; fi
+    local role="$O_ROLE" r
+    if [[ -z "$role" ]]; then
+        choose r "Which server is this?" "Foreign (exit) server: create the tunnel and print a connection key" \
+            "Iran (entry) server: paste the connection key" "Iran (entry) server: enter the values manually"
+        case "$r" in
+            1) role=foreign ;;
+            2) local k; ask k "Paste the connection key"; tunnel_add_iran_key "$k"; return ;;
+            3) role=iran ;;
+            *) return 0 ;;
+        esac
+    fi
+    case "$role" in
+        foreign) tunnel_add_foreign ;;
+        iran) tunnel_add_iran_manual ;;
+        *) die "--role must be iran or foreign." ;;
+    esac
+}
+tunnel_add_foreign() {
+    local fam local_ peer net
+    fam=$(ask_family)
+    C=()
+    ask_addr local_ "$fam" "This (foreign) server's public IPv$fam" "${O_LOCAL:-$(detect_local "$fam")}"
+    local_has_addr "$local_" || warn "$local_ is not configured on this server (fine only behind 1:1 NAT)."
+    ask_addr peer "$fam" "The Iran server's public IPv$fam" "$O_PEER"
+    C=([NAME]="${O_NAME:-$(next_tun_name)}" [FAMILY]="$fam" [ROLE]=foreign [LOCAL]="$local_" [REMOTE]="$peer" [ORIGIN]=gretun)
+    valid_name "${C[NAME]}" || die "Invalid tunnel name: ${C[NAME]}"
+    C[MTU]=$(ask_mtu "$fam")
+    net=$(alloc_net4)
+    fill_inner foreign "$net"
+    local name="${C[NAME]}"
+    create_tunnel || return 1
+    print_key "$name"
+}
+tunnel_add_iran_key() {
+    key_decode "$1" || die "This connection key is not valid (copy it again, completely)."
+    local_has_addr "$K_IRAN" || warn "The key says this server is $K_IRAN, but that address is not configured here."
+    if [[ -f "$TUN_DIR/${O_NAME:-x}.conf" ]]; then die "Tunnel $O_NAME already exists."; fi
+    C=([NAME]="${O_NAME:-$(next_tun_name)}" [FAMILY]="$K_FAMILY" [ROLE]=iran [LOCAL]="$(norm_ip "$K_IRAN")"
+        [REMOTE]="$(norm_ip "$K_FOREIGN")" [MTU]="$K_MTU" [ORIGIN]=gretun)
+    fill_inner iran "$K_NET"
+    prefix_free "$K_NET" || die "The tunnel network $K_NET is already used on this server. Create a new key on the foreign server."
+    tunnel_add_iran_finish
+}
+tunnel_add_iran_manual() {
+    local fam local_ peer net
+    fam=$(ask_family)
+    ask_addr local_ "$fam" "This (Iran) server's public IPv$fam" "${O_LOCAL:-$(detect_local "$fam")}"
+    ask_addr peer "$fam" "The foreign server's public IPv$fam" "$O_PEER"
+    while :; do
+        ask net "Tunnel network shown on the foreign server (e.g. 10.45.12.0/30)" "$O_INNER_NET"
+        net=$(norm_tun_net "$net") && break
+        (( ASSUME_YES || ! HAVE_TTY )) && die "Invalid tunnel network (use --inner-net 10.X.Y.0/30)."
+        warn "Use the form 10.X.Y.0/30."
+    done
+    C=([NAME]="${O_NAME:-$(next_tun_name)}" [FAMILY]="$fam" [ROLE]=iran [LOCAL]="$local_" [REMOTE]="$peer" [ORIGIN]=gretun)
+    C[MTU]=$(ask_mtu "$fam")
+    fill_inner iran "$net"
+    tunnel_add_iran_finish
+}
+tunnel_add_iran_finish() {
+    local n="${C[NAME]}" peer4="${C[IN4_PEER]}" peer6="${C[IN6_PEER]}" i
+    create_tunnel || return 1
+    (( DRY )) && return 0
+    info "Testing the tunnel (ping ${peer4})..."
+    for i in 1 2 3 4 5; do
+        if ping_peer "$peer4" 3; then
+            ok "IPv4 inside the tunnel works: ${PING_RTT} ms, ${PING_LOSS}% loss."
+            if ping_peer "$peer6" 3; then ok "IPv6 inside the tunnel works: ${PING_RTT} ms."
+            else warn "IPv6 inside the tunnel does not answer yet (the foreign side may run an old version)."; fi
+            tunnel_status "$n"
+            return 0
+        fi
+        : "$i"
+    done
+    warn "No reply from the foreign server through $n yet."
+    hint "Check that the tunnel exists on the foreign server (gretun tunnel list there)."
+    hint "Check that the providers do not block GRE (protocol 47)."
+    hint "The tunnel stays configured and is retried every minute; see: gretun doctor"
+}
+tunnel_used_by() {  # prints what depends on tunnel NAME
+    local f
+    tun_load "$1" || return 0
+    local p4="${C[IN4_PEER]}" p6="${C[IN6_PEER]:-x}"
+    for f in "$PG_DIR"/*.conf; do conf_load "$f" && [[ "$(cget TUNNEL)" == "$1" ]] && printf 'PasarGuard node %s\n' "$(cget NODE)"; done
+    for f in "$EXIT_DIR"/*.conf; do conf_load "$f" && [[ "$(cget TUNNEL)" == "$1" ]] && printf 'exit for %s\n' "$(cget TUNNEL)"; done
+    if [[ -f "$RULES" ]]; then
+        awk -v a="$p4" -v b="$p6" '$1 !~ /^#/ && ($2 == a || $2 == b) {print "forwarder port " $1}' "$RULES"
+    fi
+    C=()
+}
+pick_tunnel() {  # pick_tunnel VAR [role]
+    local __names=() __n __c
+    for __n in $(tun_list); do
+        tun_load "$__n" || continue
+        [[ -z "${2:-}" || "${C[ROLE]}" == "$2" ]] && __names+=("$__n")
+    done
+    C=()
+    (( ${#__names[@]} )) || die "No ${2:+$2-side }tunnel exists yet. Create one in section 1."
+    if [[ -n "$O_TUNNEL" ]]; then printf -v "$1" '%s' "$O_TUNNEL"; return 0; fi
+    if (( ${#__names[@]} == 1 )); then printf -v "$1" '%s' "${__names[0]}"; return 0; fi
+    choose __c "Which tunnel?" "${__names[@]}"
+    (( __c > 0 )) || exit 0
+    printf -v "$1" '%s' "${__names[__c - 1]}"
+}
+cmd_tunnel_remove() {
+    local n="${ARGS[0]:-}" used
+    if [[ -z "$n" ]]; then pick_tunnel n; fi
+    tun_load "$n" || die "Unknown tunnel: $n"
+    local remote="${C[REMOTE]}"
+    used=$(tunnel_used_by "$n")
+    if [[ -n "$used" ]]; then
+        warn "Tunnel $n is used by:"
+        printf '       %s\n' "$used"
+        (( FORCE )) || die "Remove those first, or use --force."
+    fi
+    confirm "Remove tunnel $n?" N || return 0
+    if (( ! TEST_MODE )); then run systemctl disable "gretun@$n.service" >/dev/null 2>&1 || true; fi
+    remove_file "$TUN_DIR/$n.conf"
+    ufw_gre delete "$remote"
+    sync_all
+    ok "Tunnel $n removed."
+}
+cmd_tunnel_key() {
+    local n="${ARGS[0]:-}"
+    if [[ -z "$n" ]]; then pick_tunnel n foreign; fi
+    tun_load "$n" || die "Unknown tunnel: $n"
+    [[ "${C[ROLE]}" == foreign ]] || die "Keys are printed on the foreign server (this side is ${C[ROLE]})."
+    print_key "$n"
+}
+
+# ---------------------------------------------------------------- imports
+legacy_present() {
+    [[ -f "$LEGACY_DIR/imported-haproxy-forwarder" ]] && return 1
+    [[ -e "$R/etc/haproxy/forwarder-tunnels" || -e "$R/etc/haproxy/forwarder.rules" \
+        || -e "$R/usr/local/sbin/haproxy-forwarder" ]] && return 0
+    unit_exists haproxy-forwarder-heal.timer
+}
+legacy_guard() {
+    legacy_present || return 0
+    warn "This server was set up with haproxy-forwarder (HAProxy.sh / HAProxy-GRE6.sh)."
+    hint "gretun must not run next to it. Import it first (no downtime for tunnels):"
+    hint "gretun tunnel import legacy"
+    if (( HAVE_TTY && ! ASSUME_YES )) && confirm "Import it now?" Y; then
+        cmd_import_legacy
+        return 0
+    fi
+    exit 1
+}
+cmd_import() {
+    case "${ARGS[0]:-}" in
+        legacy) cmd_import_legacy ;;
+        manual) cmd_import_manual ;;
+        "")
+            local c
+            choose c "Import an existing setup" "Manual tunnel (gre1 from /usr/local/bin/gre-up.sh + gre.service)" \
+                "haproxy-forwarder (HAProxy.sh / HAProxy-GRE6.sh): tunnels and port rules"
+            case "$c" in 1) cmd_import_manual ;; 2) cmd_import_legacy ;; esac ;;
+        *) die "Usage: gretun tunnel import [manual|legacy]" ;;
+    esac
+}
+cmd_import_manual() {
+    need_base
+    local ifc="${O_IF:-gre1}" role="$O_ROLE" a pfx peer net fam line v6=""
+    [[ -f "$TUN_DIR/$ifc.conf" ]] && die "$ifc is already managed by gretun."
+    iface_exists "$ifc" || die "Interface $ifc does not exist (bring the old tunnel up first)."
+    link_info "$ifc"
+    [[ "$LI_KIND" == gre || "$LI_KIND" == ip6gre ]] || die "$ifc is not a gre/ip6gre tunnel."
+    [[ "$LI_LOCAL" != any ]] || die "$ifc has no local address set; recreate it with 'local ADDR'."
+    fam=4
+    if [[ "$LI_KIND" == ip6gre ]]; then fam=6; fi
+    if [[ -z "$role" ]]; then
+        local c
+        choose c "Which server is this?" "Iran (entry) server" "Foreign (exit) server"
+        case "$c" in 1) role=iran ;; 2) role=foreign ;; *) return 0 ;; esac
+    fi
+    line=$(ip -o -4 addr show dev "$ifc" | head -n1)
+    [[ -n "$line" ]] || die "$ifc has no IPv4 address."
+    a=$(awk '{print $4}' <<<"$line")
+    pfx="${a#*/}" a="${a%/*}"
+    peer=$(awk '{for (i = 1; i < NF; i++) if ($i == "peer") {sub(/\/.*/, "", $(i + 1)); print $(i + 1)}}' <<<"$line")
+    if [[ -z "$peer" ]]; then
+        local n base
+        n=$(ip2int "$a")
+        if [[ "$pfx" == 30 ]]; then
+            base=$(( n & ~3 & 0xffffffff ))
+            if (( n == base + 1 )); then peer=$(int2ip $((base + 2))); else peer=$(int2ip $((base + 1))); fi
+        elif [[ "$pfx" == 31 ]]; then
+            peer=$(int2ip $(( n ^ 1 )))
+        else
+            ask peer "Inner IPv4 of the other server on $ifc" "$O_INNER_PEER"
+            is_ipv4 "$peer" || die "Invalid address: $peer"
+        fi
+    fi
+    net=$(cidr_norm "$a/$pfx")
+    C=([NAME]="$ifc" [FAMILY]="$fam" [ROLE]="$role" [LOCAL]="$(norm_ip "$LI_LOCAL")" [REMOTE]="$(norm_ip "$LI_REMOTE")"
+        [MTU]="$LI_MTU" [IN4_LOCAL]="$a" [IN4_PEER]="$peer" [IN4_PREFIX]="$pfx" [ORIGIN]=manual)
+    v6=$(ip -o -6 addr show dev "$ifc" scope global | awk '{print $4; exit}')
+    if [[ -n "$v6" && "${v6#*/}" == 64 ]]; then
+        C[IN6_LOCAL]=$(compress6 "${v6%/*}")
+        case "${C[IN6_LOCAL]}" in
+            *::1) C[IN6_PEER]="${C[IN6_LOCAL]%::1}::2" ;;
+            *::2) C[IN6_PEER]="${C[IN6_LOCAL]%::2}::1" ;;
+            *) C[IN6_PEER]="" ;;
+        esac
+    else
+        local p6
+        p6=$(ula_prefix "$net")
+        if [[ "$role" == iran ]]; then
+            C[IN6_LOCAL]=$(ula_host "$p6" 1) C[IN6_PEER]=$(ula_host "$p6" 2)
+        else
+            C[IN6_LOCAL]=$(ula_host "$p6" 2) C[IN6_PEER]=$(ula_host "$p6" 1)
+        fi
+    fi
+    section "Import $ifc"
+    printf '  %s, IPv%s %s -> %s, mtu %s\n  inner %s <-> %s, %s <-> %s\n' "$role" "$fam" "${C[LOCAL]}" \
+        "${C[REMOTE]}" "${C[MTU]}" "$a" "$peer" "${C[IN6_LOCAL]}" "${C[IN6_PEER]:-?}"
+    confirm "Take over $ifc (the interface stays up)?" Y || return 0
+    rb_begin "import $ifc"
+    tun_save
+    owned_add "$ifc"
+    if (( ! TEST_MODE )); then
+        if svc_enabled gre.service; then
+            run systemctl disable gre.service >/dev/null 2>&1 || true
+            rb_undo systemctl enable gre.service
+            info "gre.service disabled (not stopped: $ifc stays up)."
+        fi
+    fi
+    local cron="$R/etc/cron.d/wg-offload"
+    if [[ -f "$cron" ]]; then
+        if grep -qE '\bwg[0-9]+\b' "$cron"; then
+            conf_load "$GLOBAL_CONF" || C=()
+            local cur
+            cur=$(cget OFFLOAD_IFACES)
+            local w
+            while read -r w; do
+                [[ " $cur " == *" $w "* ]] || cur="${cur:+$cur }$w"
+            done < <(grep -oE '\bwg[0-9]+\b' "$cron" | sort -u)
+            C[OFFLOAD_IFACES]="$cur"
+            write_file "$GLOBAL_CONF" 640 "$(conf_text OFFLOAD_IFACES)" || true
+        fi
+        run mkdir -p "$LEGACY_DIR"
+        run mv -f "$cron" "$LEGACY_DIR/cron.d-wg-offload"
+        rb_undo mv -f "$LEGACY_DIR/cron.d-wg-offload" "$cron"
+        info "/etc/cron.d/wg-offload moved to $LEGACY_DIR (replaced by a udev rule)."
+    fi
+    ufw_gre allow "$(norm_ip "$LI_REMOTE")"
+    sync_all || warn "Some parts could not be applied; see: gretun doctor"
+    tunnel_status "$ifc"
+    rb_arm 180
+}
+cmd_import_legacy() {
+    need_base
+    local tf="$R/etc/haproxy/forwarder-tunnels" rf="$R/etc/haproxy/forwarder.rules"
+    local n r l6 r6 lt rt m rest u
+    legacy_present || { info "No haproxy-forwarder installation found."; return 0; }
+    section "Import haproxy-forwarder"
+    [[ -f "$tf" ]] && printf '  tunnels: %s\n' "$(grep -vc '^#' "$tf" || true)"
+    [[ -f "$rf" ]] && printf '  port rules: %s\n' "$(grep -vc '^#' "$rf" || true)"
+    printf '  Tunnels keep their names and stay up; the old units are disabled and\n'
+    printf '  the old script is moved to %s.\n' "$LEGACY_DIR"
+    confirm "Import now?" Y || return 0
+    rb_begin "import haproxy-forwarder"
+    if [[ -f "$tf" ]]; then
+        while read -r n r l6 r6 lt rt m rest || [[ -n "${n:-}" ]]; do
+            [[ -n "${n:-}" && "$n" != \#* ]] || continue
+            [[ -f "$TUN_DIR/$n.conf" ]] && continue
+            C=([NAME]="$n" [FAMILY]=6 [ROLE]="$r" [LOCAL]="$(norm_ip "$l6")" [REMOTE]="$(norm_ip "$r6")" [MTU]="$m" [ORIGIN]=legacy)
+            fill_inner "$r" "$(cidr_norm "$lt/30")"
+            [[ "${C[IN4_LOCAL]}" == "$lt" && "${C[IN4_PEER]}" == "$rt" ]] || { C[IN4_LOCAL]="$lt" C[IN4_PEER]="$rt"; }
+            tun_save
+            owned_add "$n"
+            ufw_gre allow "${C[REMOTE]}"
+            ok "Tunnel $n imported."
+        done <"$tf"
+    fi
+    if [[ -f "$rf" ]]; then
+        # Merged into gretun's rules; the old script's rule wins on the same port.
+        rb_save_file "$RULES"
+        fwd_load
+        local -a keep=("${F_LISTEN[@]}") kip=("${F_IP[@]}") kd=("${F_DPORT[@]}") ko=("${F_OPTS[@]}") i
+        RULES="$rf" fwd_load
+        local -a ol=("${F_LISTEN[@]}") oi=("${F_IP[@]}") od=("${F_DPORT[@]}") oo=("${F_OPTS[@]}")
+        F_LISTEN=("${keep[@]}") F_IP=("${kip[@]}") F_DPORT=("${kd[@]}") F_OPTS=("${ko[@]}")
+        for i in "${!ol[@]}"; do fwd_set "${ol[i]}" "${oi[i]}" "${od[i]}" "${oo[i]}"; done
+        write_file "$RULES" 640 "$(fwd_text)" || true
+        ok "${#ol[@]} port rule(s) imported into $RULES."
+    fi
+    if (( ! TEST_MODE )); then
+        for u in haproxy-forwarder-heal.timer haproxy-forwarder-heal.service; do
+            if svc_enabled "$u" || svc_active "$u"; then
+                run systemctl disable --now "$u" >/dev/null 2>&1 || true
+                rb_undo systemctl enable --now "$u"
+            fi
+        done
+        if svc_enabled haproxy-forwarder-tunnel.service; then
+            run systemctl disable haproxy-forwarder-tunnel.service >/dev/null 2>&1 || true
+            rb_undo systemctl enable haproxy-forwarder-tunnel.service
+        fi
+    fi
+    run mkdir -p "$LEGACY_DIR"
+    if [[ -f "$R/usr/local/sbin/haproxy-forwarder" ]]; then
+        run mv -f "$R/usr/local/sbin/haproxy-forwarder" "$LEGACY_DIR/haproxy-forwarder"
+        rb_undo mv -f "$LEGACY_DIR/haproxy-forwarder" "$R/usr/local/sbin/haproxy-forwarder"
+    fi
+    if (( ! DRY )); then date >"$LEGACY_DIR/imported-haproxy-forwarder"; fi
+    rb_undo rm -f "$LEGACY_DIR/imported-haproxy-forwarder"
+    sync_all || warn "Some parts could not be applied; see: gretun doctor"
+    if [[ -s "$RULES" ]]; then
+        if [[ -f "$HAPROXY_CFG" ]]; then
+            rb_save_file "$HAPROXY_CFG"
+            rb_after systemctl reload-or-restart haproxy
+        fi
+        # The old UDP unit holds the ports: stop it right before ours starts.
+        if (( ! TEST_MODE )) && unit_exists haproxy-forwarder-udp.service; then
+            run systemctl disable --now haproxy-forwarder-udp.service >/dev/null 2>&1 || true
+            rb_after systemctl enable --now haproxy-forwarder-udp.service
+        fi
+        rb_after systemctl disable --now "$UDP_UNIT.service"
+        fwd_apply || warn "Forwarder rules could not be applied; see: gretun fwd status"
+    fi
+    tunnel_status
+    rb_arm 180
+}
+
+# ======================================================================
+# Section 2: plain IPv6 port forwarder (no tunnel needed)
+# ======================================================================
+# /etc/gretun/forward.rules is the single source of truth:
+#   <listen_port> <destination_ip> <destination_port> <options>
+# options: comma list of tcp, udp, proxy (PROXY v2), check (health check)
+F_LISTEN=() F_IP=() F_DPORT=() F_OPTS=()
+FWD_BK="$BK/forward"
+HAPROXY_ORIG="$BK/haproxy.cfg.original"
+
+fwd_load() {
+    F_LISTEN=() F_IP=() F_DPORT=() F_OPTS=()
+    [[ -f "$RULES" ]] || return 0
+    local l ip d o rest
+    while read -r l ip d o rest || [[ -n "${l:-}" ]]; do
+        [[ -n "${l:-}" && "$l" != \#* ]] || continue
+        if valid_port "$l" && valid_port "${d:-}" && { is_ipv4 "${ip:-}" || is_ipv6 "${ip:-}"; }; then
+            fwd_set "$((10#$l))" "$(norm_ip "$ip")" "$((10#$d))" "${o:-tcp}"
+        else
+            warn "Ignoring invalid line in $RULES: $l ${ip:-} ${d:-}"
+        fi
+    done <"$RULES"
+}
+fwd_text() {
+    local i
+    printf '%s\n# <listen_port> <destination_ip> <destination_port> <options: tcp,udp,proxy,check>\n' "$MARK"
+    for i in $(fwd_sorted); do
+        printf '%s %s %s %s\n' "${F_LISTEN[i]}" "${F_IP[i]}" "${F_DPORT[i]}" "${F_OPTS[i]}"
+    done
+}
+fwd_sorted() {
+    local i
+    for i in "${!F_LISTEN[@]}"; do printf '%s %s\n' "${F_LISTEN[i]}" "$i"; done | sort -n | awk '{print $2}'
+}
+fwd_find() {
+    local i
+    for i in "${!F_LISTEN[@]}"; do
+        if [[ "${F_LISTEN[i]}" == "$1" ]]; then printf '%s' "$i"; return 0; fi
+    done
+    return 1
+}
+fwd_set() {  # fwd_set LISTEN IP DPORT OPTS
+    local i
+    i=$(fwd_find "$1") || i=${#F_LISTEN[@]}
+    F_LISTEN[i]="$1" F_IP[i]="$2" F_DPORT[i]="$3" F_OPTS[i]="$4"
+}
+fwd_del() {
+    local i
+    i=$(fwd_find "$1") || return 1
+    unset "F_LISTEN[i]" "F_IP[i]" "F_DPORT[i]" "F_OPTS[i]"
+    F_LISTEN=("${F_LISTEN[@]}") F_IP=("${F_IP[@]}") F_DPORT=("${F_DPORT[@]}") F_OPTS=("${F_OPTS[@]}")
+}
+valid_port() { [[ "$1" =~ ^[0-9]{1,5}$ ]] && (( 10#$1 >= 1 && 10#$1 <= 65535 )); }
+has_opt() { [[ ",$1," == *",$2,"* ]]; }
+fwd_count() {  # fwd_count tcp|udp
+    local i n=0
+    for i in "${!F_OPTS[@]}"; do if has_opt "${F_OPTS[i]}" "$1"; then n=$((n + 1)); fi; done
+    printf '%s' "$n"
+}
+host_port() { if [[ "$1" == *:* ]]; then printf '[%s]:%s' "$1" "$2"; else printf '%s:%s' "$1" "$2"; fi; }
+# "443,8443" or "4040=443" (listen=destination) -> "LISTEN DPORT" lines
+parse_ports() {
+    local item l d
+    for item in $(split_list "$1"); do
+        if [[ "$item" == *=* ]]; then l="${item%%=*}" d="${item#*=}"; else l="$item" d="$item"; fi
+        valid_port "$l" && valid_port "$d" || { err "Invalid port: $item"; return 1; }
+        printf '%s %s\n' "$((10#$l))" "$((10#$d))"
+    done
+}
+
+# ---------------------------------------------------------------- packages
+ensure_haproxy() {
+    have haproxy && return 0
+    (( HEAL_MODE )) && return 1
+    confirm "HAProxy (TCP forwarding) is not installed. Install it now?" Y || die "HAProxy is required for TCP rules."
+    apt_install haproxy >/dev/null || die "Could not install HAProxy (see README: offline install)."
+    if (( ! DRY )); then mkdir -p "$ETC"; touch "$ETC/.installed-haproxy"; fi
+}
+nginx_has_stream() {
+    have nginx || return 1
+    [[ -f "$NGINX_STREAM_MODULE" ]] && return 0
+    nginx -V 2>&1 | tr ' ' '\n' | grep -qx -- '--with-stream'
+}
+ensure_udp_engine() {
+    nginx_has_stream && { write_udp_unit; return 0; }
+    (( HEAL_MODE )) && return 1
+    local had=0 rc=0 policy="$R/usr/sbin/policy-rc.d" added=0
+    if have nginx; then
+        had=1
+        warn "nginx is installed but has no stream module. Installing libnginx-mod-stream also enables the"
+        warn "module for your existing nginx (it only loads it; your sites are not changed)."
+        if [[ -d "$R/etc/nginx" ]]; then
+            run mkdir -p "$BK"
+            run tar -C "$R/etc" -czf "$BK/etc-nginx.$(date +%Y%m%d-%H%M%S).tgz" nginx
+            info "Backup of /etc/nginx saved in $BK."
+        fi
+        confirm "Continue?" N || die "UDP rules need the nginx stream module."
+    else
+        confirm "UDP forwarding needs nginx with the stream module. Install it now?" Y || die "UDP rules need nginx."
+    fi
+    # Keep the stock nginx service from starting and taking port 80.
+    if (( ! had && ! DRY )) && [[ ! -e "$policy" ]]; then
+        printf '#!/bin/sh\nexit 101\n' >"$policy"
+        chmod 755 "$policy"
+        added=1
+    fi
+    if (( had )); then apt_install libnginx-mod-stream >/dev/null || rc=$?
+    else apt_install nginx libnginx-mod-stream >/dev/null || rc=$?; fi
+    if (( added )); then rm -f "$policy"; fi
+    (( rc == 0 )) || die "Could not install nginx (see README: offline install)."
+    if (( ! had )); then
+        if (( ! TEST_MODE )); then run systemctl disable --now nginx >/dev/null 2>&1 || true; fi
+        if (( ! DRY )); then touch "$ETC/.installed-nginx"; fi
+    fi
+    nginx_has_stream || (( DRY )) || die "The nginx stream module is not available."
+    write_udp_unit
+}
+write_udp_unit() {
+    (( TEST_MODE )) && return 0
+    local bin
+    bin=$(command -v nginx || echo /usr/sbin/nginx)
+    if write_file "$SYSTEMD_DIR/$UDP_UNIT.service" 644 "$MARK
+[Unit]
+Description=gretun UDP port forwarder (dedicated nginx stream instance)
+After=network-online.target gretun-heal.service
+Wants=network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+ExecStartPre=$bin -t -q -c $UDP_CFG
+ExecStart=$bin -c $UDP_CFG
+ExecReload=$bin -t -q -c $UDP_CFG
+ExecReload=/bin/kill -HUP \$MAINPID
+KillSignal=SIGQUIT
+KillMode=mixed
+TimeoutStopSec=5
+Restart=always
+RestartSec=2
+LimitNOFILE=$NOFILE_LIMIT
+
+[Install]
+WantedBy=multi-user.target"; then daemon_reload; fi
+}
+write_haproxy_dropin() {
+    (( TEST_MODE )) && return 0
+    if write_file "$HAPROXY_DROPIN" 644 "$MARK
+[Unit]
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+LimitNOFILE=$NOFILE_LIMIT
+Restart=always
+RestartSec=3"; then daemon_reload; fi
+}
+
+# ---------------------------------------------------------------- haproxy.cfg ownership
+haproxy_cfg_owner() {  # ours | legacy | stock | foreign | missing
+    [[ -f "$HAPROXY_CFG" ]] || { printf missing; return 0; }
+    if grep -qF "$MARK" "$HAPROXY_CFG"; then printf ours; return 0; fi
+    if grep -qE '^# (Managed by haproxy-forwarder|HAProxy IPv4 -> IPv6 Forwarder)' "$HAPROXY_CFG"; then
+        if [[ -f "$LEGACY_DIR/imported-haproxy-forwarder" ]] || (( DRY )); then printf ours; else printf legacy; fi
+        return 0
+    fi
+    if ! grep -qE '^[[:space:]]*(listen|frontend|backend)[[:space:]]' "$HAPROXY_CFG"; then printf stock; return 0; fi
+    printf foreign
+}
+# Never overwrites an unrelated haproxy.cfg silently.
+claim_haproxy_cfg() {
+    local owner
+    owner=$(haproxy_cfg_owner)
+    case "$owner" in
+        ours|missing) return 0 ;;
+        legacy) die "haproxy.cfg belongs to haproxy-forwarder. Run: gretun tunnel import legacy" ;;
+        stock|foreign)
+            if [[ "$owner" == foreign ]]; then
+                warn "$HAPROXY_CFG has its own frontends/backends (not written by gretun)."
+                if (( HEAL_MODE )); then return 1; fi
+                if (( ASSUME_YES && ! REPLACE_HAPROXY )); then
+                    die "Refusing to replace it without --replace-haproxy-cfg."
+                fi
+                if (( ! REPLACE_HAPROXY )); then
+                    confirm "Replace it? (a backup is kept; the services in it will stop)" N || die "Cancelled."
+                fi
+            fi
+            if (( ! DRY )); then
+                mkdir -p "$BK"
+                [[ -f "$HAPROXY_ORIG" ]] || cp -a "$HAPROXY_CFG" "$HAPROXY_ORIG"
+                cp -a "$HAPROXY_CFG" "$BK/haproxy.cfg.before-gretun.$(date +%Y%m%d-%H%M%S)"
+            fi
+            info "Original haproxy.cfg saved as $HAPROXY_ORIG." ;;
+    esac
+}
+
+# ---------------------------------------------------------------- generators
+gen_haproxy() {  # gen_haproxy FILE SPLICE(0|1)
+    local i server mem maxconn sock="/run/haproxy/admin.sock"
+    mem=$(awk '/MemTotal/ {print int($2 / 1024)}' /proc/meminfo 2>/dev/null || echo 1024)
+    # Roughly 32 KB per connection pair, at most a quarter of the RAM.
+    maxconn=$(( mem * 1024 / 4 / 32 ))
+    (( maxconn < 2000 )) && maxconn=2000
+    (( maxconn > 500000 )) && maxconn=500000
+    if (( TEST_MODE )); then sock="$RUNDIR/haproxy.sock"; fi
+    {
+        printf '%s\n# HAProxy TCP forwarder. Do not edit: rebuilt from %s\n\n' "$MARK" "${RULES#"$R"}"
+        printf 'global\n    log /dev/log local0 notice\n'
+        if (( ! TEST_MODE )); then
+            printf '    chroot /var/lib/haproxy\n    user haproxy\n    group haproxy\n'
+        fi
+        printf '    stats socket %s mode 660 level admin expose-fd listeners\n' "$sock"
+        printf '    stats timeout 30s\n    daemon\n    maxconn %s\n\n' "$maxconn"
+        printf 'defaults\n    log global\n    mode tcp\n    option dontlognull\n'
+        printf '    option clitcpka\n    option srvtcpka\n'
+        if (( $2 )); then printf '    option splice-auto\n'; fi
+        printf '    maxconn %s\n    retries 3\n    timeout connect 5s\n' "$maxconn"
+        printf '    timeout client 1h\n    timeout server 1h\n    timeout client-fin 30s\n    timeout server-fin 30s\n\n'
+        for i in $(fwd_sorted); do
+            has_opt "${F_OPTS[i]}" tcp || continue
+            server="server fwd_${F_LISTEN[i]} $(host_port "${F_IP[i]}" "${F_DPORT[i]}")"
+            if has_opt "${F_OPTS[i]}" proxy; then server+=" send-proxy-v2"; fi
+            if has_opt "${F_OPTS[i]}" check; then server+=" $HEALTH_CHECK"; fi
+            printf 'listen fwd_%s\n    bind :%s\n    %s\n\n' "${F_LISTEN[i]}" "${F_LISTEN[i]}" "$server"
+        done
+    } >"$1"
+}
+gen_udp() {  # gen_udp FILE
+    local i pid="/run/$UDP_UNIT.pid"
+    if (( TEST_MODE )); then pid="$RUNDIR/$UDP_UNIT.nginx.pid"; fi
+    {
+        printf '%s\n# UDP forwarder (nginx stream). Do not edit: rebuilt from %s\n\n' "$MARK" "${RULES#"$R"}"
+        if [[ -f "$NGINX_STREAM_MODULE" ]]; then printf 'load_module %s;\n\n' "$NGINX_STREAM_MODULE"; fi
+        cat <<EOF
+user www-data;
+worker_processes auto;
+worker_rlimit_nofile $NOFILE_LIMIT;
+worker_shutdown_timeout 30s;
+pid $pid;
+daemon off;
+error_log stderr warn;
+
+events {
+    worker_connections 65535;
+}
+
+stream {
+    proxy_timeout $UDP_TIMEOUT;
+EOF
+        for i in $(fwd_sorted); do
+            has_opt "${F_OPTS[i]}" udp || continue
+            printf '\n    server {\n        listen %s udp reuseport;\n        proxy_pass %s;\n    }\n' \
+                "${F_LISTEN[i]}" "$(host_port "${F_IP[i]}" "${F_DPORT[i]}")"
+        done
+        printf '}\n'
+    } >"$1"
+}
+# Builds both configs into DIR; haproxy.cfg without splice if unsupported.
+fwd_build() {  # fwd_build DIR -> 0 when valid
+    local d="$1" out
+    if (( $(fwd_count tcp) )); then
+        gen_haproxy "$d/haproxy.cfg" 1
+        if ! haproxy -c -q -f "$d/haproxy.cfg" >/dev/null 2>&1; then
+            gen_haproxy "$d/haproxy.cfg" 0
+            out=$(haproxy -c -f "$d/haproxy.cfg" 2>&1) || { printf '%s\n' "$out" >&2; return 1; }
+        fi
+    fi
+    if (( $(fwd_count udp) )); then
+        gen_udp "$d/udp.conf"
+        out=$(nginx -t -q -c "$d/udp.conf" 2>&1) || { printf '%s\n' "$out" >&2; return 1; }
+    fi
+}
+
+# ---------------------------------------------------------------- apply
+fwd_backup() {  # copies rules + configs into a new backup dir; prints it
+    local d n
+    d="$FWD_BK/$(date +%Y%m%d-%H%M%S)"
+    n=1
+    while [[ -e "$d" ]]; do n=$((n + 1)); d="$FWD_BK/$(date +%Y%m%d-%H%M%S)-$n"; done
+    mkdir -p "$d"
+    [[ -f "$RULES" ]] && cp -a "$RULES" "$d/forward.rules"
+    [[ -f "$HAPROXY_CFG" ]] && cp -a "$HAPROXY_CFG" "$d/haproxy.cfg"
+    [[ -f "$UDP_CFG" ]] && cp -a "$UDP_CFG" "$d/udp.conf"
+    find "$FWD_BK" -mindepth 1 -maxdepth 1 -type d | sort -r | tail -n +"$((BACKUP_KEEP + 1))" | xargs -r rm -rf --
+    printf '%s' "$d"
+}
+fwd_restore() {  # fwd_restore BACKUP_DIR
+    local d="$1"
+    if [[ -f "$d/forward.rules" ]]; then cp -a "$d/forward.rules" "$RULES"; else rm -f "$RULES"; fi
+    if [[ -f "$d/haproxy.cfg" ]]; then cp -a "$d/haproxy.cfg" "$HAPROXY_CFG"; fi
+    if [[ -f "$d/udp.conf" ]]; then cp -a "$d/udp.conf" "$UDP_CFG"; else rm -f "$UDP_CFG"; fi
+}
+install_cfg() {  # install_cfg SRC DEST GROUP
+    local g=root
+    if getent group "$3" >/dev/null 2>&1; then g="$3"; fi
+    mkdir -p "$(dirname "$2")"
+    install -m 640 -o root -g "$g" "$1" "$2.gretun.$$"
+    mv -f "$2.gretun.$$" "$2"
+}
+svc_up() {  # svc_up UNIT: hitless reload when running, start otherwise
+    if (( TEST_MODE )); then
+        if test_daemon_active "$1"; then test_daemon reload "$1"; else test_daemon start "$1"; fi
+        return
+    fi
+    run systemctl enable "$1" >/dev/null 2>&1 || true
+    if svc_active "$1"; then
+        run systemctl reload "$1" || run systemctl restart "$1"
+    else
+        run systemctl restart "$1"
+    fi
+}
+svc_down() {
+    if (( TEST_MODE )); then test_daemon stop "$1"; return 0; fi
+    run systemctl disable --now "$1" >/dev/null 2>&1 || true
+}
+port_listening() {  # port_listening tcp|udp PORT
+    local f=-lnt
+    [[ "$1" == udp ]] && f=-lnu
+    [[ -n "$(ss -H "$f" "sport = :$2" 2>/dev/null)" ]]
+}
+port_owner() {
+    local f=-lntp
+    [[ "$1" == udp ]] && f=-lnup
+    ss -H "$f" "sport = :$2" 2>/dev/null | grep -oE 'users:\(\("[^"]+"' | head -n1 | cut -d'"' -f2
+}
+fwd_verify() {
+    local i t bad=0
+    for t in 1 2 3 4 5 6 7 8 9 10; do
+        bad=0
+        for i in "${!F_LISTEN[@]}"; do
+            if has_opt "${F_OPTS[i]}" tcp && ! port_listening tcp "${F_LISTEN[i]}"; then bad=1; fi
+            if has_opt "${F_OPTS[i]}" udp && ! port_listening udp "${F_LISTEN[i]}"; then bad=1; fi
+        done
+        (( bad )) || return 0
+        sleep 0.5
+        : "$t"
+    done
+    return 1
+}
+# fwd_apply: rules file -> configs -> services. On failure the previous
+# rules and configs are restored and reloaded.
+fwd_apply() {
+    fwd_load
+    local ntcp nudp tmp bk rc=0
+    ntcp=$(fwd_count tcp) nudp=$(fwd_count udp)
+    if (( ntcp )); then ensure_haproxy || return 1; claim_haproxy_cfg || return 1; write_haproxy_dropin; fi
+    if (( nudp )); then ensure_udp_engine || return 1; fi
+    tmp=$(mktemp -d)
+    if ! fwd_build "$tmp"; then
+        rm -rf "$tmp"
+        err "The generated configuration is not valid; nothing was changed."
+        return 1
+    fi
+    if (( DRY )); then
+        printf '%s[dry-run]%s install haproxy.cfg (%s TCP) and %s (%s UDP), reload services\n' \
+            "$DIM" "$NC" "$ntcp" "$UDP_CFG" "$nudp"
+        rm -rf "$tmp"
+        return 0
+    fi
+    bk=$(fwd_backup)
+    if (( ntcp )); then
+        install_cfg "$tmp/haproxy.cfg" "$HAPROXY_CFG" haproxy
+        svc_up haproxy || rc=1
+    elif [[ "$(haproxy_cfg_owner)" == ours ]] && { svc_active haproxy || (( TEST_MODE )); }; then
+        svc_down haproxy
+    fi
+    if (( nudp )); then
+        install_cfg "$tmp/udp.conf" "$UDP_CFG" root
+        svc_up "$UDP_UNIT" || rc=1
+    else
+        svc_down "$UDP_UNIT"
+        rm -f "$UDP_CFG"
+    fi
+    rm -rf "$tmp"
+    if (( rc == 0 )) && fwd_verify; then
+        counters_update
+        jlog "forwarder applied: $ntcp tcp, $nudp udp"
+        return 0
+    fi
+    err "The forwarder did not come up as expected; restoring the previous configuration."
+    if (( HEAL_MODE )); then return 1; fi
+    fwd_restore "$bk"
+    fwd_load
+    if (( $(fwd_count tcp) )); then svc_up haproxy || true; fi
+    if (( $(fwd_count udp) )); then svc_up "$UDP_UNIT" || true; else svc_down "$UDP_UNIT"; fi
+    counters_update
+    return 1
+}
+# fwd_commit: writes the in-memory rules and applies them (rolls back on failure).
+fwd_commit() {
+    local prev=""
+    if [[ -f "$RULES" ]]; then prev=$(cat "$RULES"); fi
+    write_file "$RULES" 640 "$(fwd_text)" || true
+    if fwd_apply; then
+        units_sync
+        return 0
+    fi
+    if (( ! DRY )); then
+        if [[ -n "$prev" ]]; then printf '%s\n' "$prev" >"$RULES"; else rm -f "$RULES"; fi
+    fi
+    return 1
+}
+
+# ---------------------------------------------------------------- counters
+counters_update() {
+    local i p proto counters="" inr="" outr="" nl=$'\n'
+    have nft || return 0
+    if (( ${#F_LISTEN[@]} == 0 )); then
+        if nft list table inet "$NFT_FWD" >/dev/null 2>&1; then run nft delete table inet "$NFT_FWD"; fi
+        return 0
+    fi
+    for i in $(fwd_sorted); do
+        p="${F_LISTEN[i]}"
+        for proto in tcp udp; do
+            has_opt "${F_OPTS[i]}" "$proto" || continue
+            counters+="    counter ${proto:0:1}${p}i { }$nl    counter ${proto:0:1}${p}o { }$nl"
+            inr+="        $proto dport $p counter name ${proto:0:1}${p}i$nl"
+            outr+="        $proto sport $p counter name ${proto:0:1}${p}o$nl"
+        done
+    done
+    run_in nft -f - <<EOF || warn "Could not create the traffic counters (nft)."
+table inet $NFT_FWD
+delete table inet $NFT_FWD
+table inet $NFT_FWD {
+$counters
+    chain input {
+        type filter hook input priority -10; policy accept;
+$inr    }
+    chain output {
+        type filter hook output priority -10; policy accept;
+$outr    }
+}
+EOF
+}
+read_counters() {  # "<name> <bytes>" lines, e.g. "t443i 12345"
+    nft list table inet "$NFT_FWD" 2>/dev/null | awk '
+        $1 == "counter" && $3 == "{" { name = $2 }
+        name != "" && /bytes/ { for (i = 1; i < NF; i++) if ($i == "bytes") print name, $(i + 1); name = "" }'
+}
+
+# ---------------------------------------------------------------- commands
+ask_dest() {  # ask_dest VAR: foreign IPv6 or the inner IP of a gretun tunnel
+    local __d __n __list=() __c
+    if [[ -n "$O_DEST" ]]; then __d="$O_DEST"
+    else
+        for __n in $(tun_list); do
+            [[ "$(conf_val "$TUN_DIR/$__n.conf" ROLE)" == iran ]] || continue
+            __list+=("$(conf_val "$TUN_DIR/$__n.conf" IN4_PEER) (foreign end of tunnel $__n)")
+        done
+        if (( ${#__list[@]} )); then
+            choose __c "Destination" "A foreign IPv6 address (no tunnel)" "${__list[@]}"
+            (( __c > 0 )) || exit 0
+            if (( __c > 1 )); then __d="${__list[__c - 2]%% *}"; fi
+        fi
+        [[ -n "${__d:-}" ]] || ask __d "Foreign server IPv6 address"
+    fi
+    __d="${__d#[}" __d="${__d%]}"
+    if is_ipv6 "$__d"; then __d=$(compress6 "$__d")
+    elif is_ipv4 "$__d"; then
+        local ok_=0
+        for __n in $(tun_list); do
+            [[ "$(conf_val "$TUN_DIR/$__n.conf" IN4_PEER)" == "$__d" ]] && ok_=1
+        done
+        (( ok_ )) || warn "$__d is not the inner IP of a gretun tunnel (allowed, but unusual)."
+    else
+        die "Not a valid destination: $__d"
+    fi
+    printf -v "$1" '%s' "$__d"
+}
+ask_proto() {  # ask_proto VAR
+    local __p="$O_PROTO" __c
+    if [[ -z "$__p" ]]; then
+        if (( ASSUME_YES || ! HAVE_TTY )); then __p=tcp
+        else
+            choose __c "Protocol" "TCP (most services: VLESS/VMess/Trojan over TCP/WS/gRPC)" "UDP (Hysteria, TUIC, WireGuard)" "TCP + UDP"
+            case "$__c" in 1) __p=tcp ;; 2) __p=udp ;; 3) __p=both ;; *) exit 0 ;; esac
+        fi
+    fi
+    case "$__p" in
+        tcp) __p=tcp ;; udp) __p=udp ;; both|tcp,udp|udp,tcp) __p=tcp,udp ;;
+        *) die "--proto must be tcp, udp or both." ;;
+    esac
+    printf -v "$1" '%s' "$__p"
+}
+cmd_fwd_add() {
+    legacy_guard
+    need_base
+    local dest ports proto opts pairs l d own i
+    ask_dest dest
+    if [[ -n "$O_PORTS" ]]; then ports="$O_PORTS"
+    else
+        printf '  Ports: %s443,8443%s (same port) or %s4040=443%s (listen 4040, forward to 443)\n' "$BOLD" "$NC" "$BOLD" "$NC"
+        ask ports "Ports"
+    fi
+    pairs=$(parse_ports "$ports") || die "Invalid port list."
+    ask_proto proto
+    opts="$proto"
+    if (( O_PROXY )) || { (( ! ASSUME_YES && HAVE_TTY )) && has_opt "$opts" tcp \
+        && confirm "Send PROXY protocol v2 (the destination must expect it)?" N; }; then opts+=",proxy"; fi
+    if (( O_CHECK )) || { (( ! ASSUME_YES && HAVE_TTY )) && has_opt "$opts" tcp \
+        && confirm "Enable TCP health checks?" N; }; then opts+=",check"; fi
+    fwd_load
+    while read -r l d; do
+        i=$(fwd_find "$l") && [[ "${F_IP[i]}" != "$dest" || "${F_DPORT[i]}" != "$d" ]] \
+            && warn "Port $l was forwarded to $(host_port "${F_IP[i]}" "${F_DPORT[i]}"); replacing it."
+        if ! fwd_find "$l" >/dev/null; then
+            for i in tcp udp; do
+                has_opt "$opts" "$i" || continue
+                if port_listening "$i" "$l"; then
+                    own=$(port_owner "$i" "$l")
+                    [[ "$own" == haproxy || "$own" == nginx ]] || die "Port $l/$i is already used by ${own:-another program}."
+                fi
+            done
+        fi
+        fwd_set "$l" "$dest" "$d" "$opts"
+    done <<<"$pairs"
+    if fwd_commit; then
+        ok "Forwarding active:"
+        while read -r l d; do printf '       :%s -> %s  (%s)\n' "$l" "$(host_port "$dest" "$d")" "$opts"; done <<<"$pairs"
+        ufw_ports allow "$pairs" "$opts"
+    else
+        die "Could not apply the rules; the previous configuration is back."
+    fi
+}
+ufw_ports() {  # ufw_ports allow|delete PAIRS OPTS
+    ufw_active || return 0
+    local l d p
+    while read -r l d; do
+        for p in tcp udp; do
+            has_opt "$3" "$p" || continue
+            if [[ "$1" == allow ]]; then run ufw allow "$l/$p" comment gretun >/dev/null 2>&1 || true
+            else run ufw delete allow "$l/$p" >/dev/null 2>&1 || true; fi
+        done
+        : "$d"
+    done <<<"$2"
+}
+cmd_fwd_list() {
+    fwd_load
+    if (( ${#F_LISTEN[@]} == 0 )); then info "No forwarding rules."; return 0; fi
+    local i
+    printf '%s%-8s %-9s %-46s %s%s\n' "$BOLD" PORT PROTO DESTINATION OPTIONS "$NC"
+    for i in $(fwd_sorted); do
+        local p="${F_OPTS[i]}" extra
+        extra=$(tr ',' '\n' <<<"$p" | grep -vxE 'tcp|udp' | paste -sd, - || true)
+        p=$(tr ',' '\n' <<<"$p" | grep -xE 'tcp|udp' | paste -sd+ - || true)
+        printf '%-8s %-9s %-46s %s\n' "${F_LISTEN[i]}" "$p" "$(host_port "${F_IP[i]}" "${F_DPORT[i]}")" "${extra:--}"
+    done
+}
+cmd_fwd_remove() {
+    local p list=("${ARGS[@]}") i
+    fwd_load
+    (( ${#F_LISTEN[@]} )) || die "There are no rules."
+    if (( ${#list[@]} == 0 )); then
+        cmd_fwd_list
+        local a
+        ask a "Ports to remove (e.g. 443,8443)"
+        mapfile -t list < <(split_list "$a")
+    fi
+    local removed=""
+    for p in "${list[@]}"; do
+        i=$(fwd_find "$((10#$p))") || { warn "No rule on port $p."; continue; }
+        ufw_ports delete "${F_LISTEN[i]} ${F_DPORT[i]}" "${F_OPTS[i]}"
+        fwd_del "$((10#$p))"
+        removed+=" $p"
+    done
+    [[ -n "$removed" ]] || return 0
+    fwd_commit || die "Could not apply; the previous rules are back."
+    ok "Removed:$removed"
+}
+cmd_fwd_status() {
+    local i p proto st tot_in=0 tot_out=0 conns b_in b_out reach
+    local -A cnt=()
+    fwd_load
+    section "Forwarder"
+    if (( $(fwd_count tcp) )); then
+        if svc_active haproxy; then st="${GREEN}running${NC}"; else st="${RED}stopped${NC}"; fi
+        printf '  haproxy (TCP):     %s\n' "$st"
+    fi
+    if (( $(fwd_count udp) )); then
+        if svc_active "$UDP_UNIT"; then st="${GREEN}running${NC}"; else st="${RED}stopped${NC}"; fi
+        printf '  %s (UDP):  %s\n' "$UDP_UNIT" "$st"
+    fi
+    (( ${#F_LISTEN[@]} )) || { info "No forwarding rules."; return 0; }
+    while read -r p b_in; do cnt[$p]="$b_in"; done < <(read_counters)
+    printf '\n%s%-7s %-5s %-44s %-7s %-6s %-11s %-11s %s%s\n' "$BOLD" PORT PROTO DESTINATION LISTEN CONNS IN OUT DEST "$NC"
+    for i in $(fwd_sorted); do
+        p="${F_LISTEN[i]}"
+        for proto in tcp udp; do
+            has_opt "${F_OPTS[i]}" "$proto" || continue
+            if port_listening "$proto" "$p"; then st="${GREEN}yes${NC}"; else st="${RED}no${NC}"; fi
+            if [[ "$proto" == tcp ]]; then
+                conns=$(ss -Htn state established "( sport = :$p )" 2>/dev/null | wc -l)
+                if timeout 3 bash -c "exec 3<>/dev/tcp/${F_IP[i]}/${F_DPORT[i]}" 2>/dev/null; then reach="${GREEN}ok${NC}"
+                else reach="${RED}unreachable${NC}"; fi
+            else
+                conns=$(ss -Hun state established "( dport = :${F_DPORT[i]} )" 2>/dev/null | wc -l)
+                reach="-"
+            fi
+            b_in="${cnt[${proto:0:1}${p}i]:-0}" b_out="${cnt[${proto:0:1}${p}o]:-0}"
+            tot_in=$((tot_in + b_in)) tot_out=$((tot_out + b_out))
+            printf '%-7s %-5s %-44s %-18s %-6s %-11s %-11s %s\n' "$p" "$proto" \
+                "$(host_port "${F_IP[i]}" "${F_DPORT[i]}")" "$st" "$conns" "$(fmt_bytes "$b_in")" "$(fmt_bytes "$b_out")" "$reach"
+        done
+    done
+    printf '\nTotal since the counters were created: in %s, out %s\n' "$(fmt_bytes "$tot_in")" "$(fmt_bytes "$tot_out")"
+}
+cmd_fwd_monitor() {
+    local iv="${O_INTERVAL:-2}" prev_t now dt k
+    local -A prev=() cur=()
+    [[ "$iv" =~ ^[0-9]+$ ]] && (( iv >= 1 )) || iv=2
+    fwd_load
+    (( ${#F_LISTEN[@]} )) || die "There are no rules to monitor."
+    nft list table inet "$NFT_FWD" >/dev/null 2>&1 || counters_update
+    trap 'printf "\n"; exit 0' INT
+    prev_t=$(date +%s.%N)
+    while read -r k dt; do prev[$k]="$dt"; done < <(read_counters)
+    while :; do
+        sleep "$iv"
+        now=$(date +%s.%N)
+        cur=()
+        while read -r k dt; do cur[$k]="$dt"; done < <(read_counters)
+        dt=$(awk -v a="$now" -v b="$prev_t" 'BEGIN {print a - b}')
+        if [[ -t 1 ]]; then printf '\033[H\033[2J'; fi
+        printf '%sgretun live monitor%s  (every %ss, Ctrl+C to stop)   %s\n\n' "$BOLD" "$NC" "$iv" "$(date '+%H:%M:%S')"
+        printf '%s%-7s %-5s %-14s %-14s %s%s\n' "$BOLD" PORT PROTO "IN (users->)" "OUT (->users)" CONNS "$NC"
+        local i p proto ci co
+        for i in $(fwd_sorted); do
+            p="${F_LISTEN[i]}"
+            for proto in tcp udp; do
+                has_opt "${F_OPTS[i]}" "$proto" || continue
+                k="${proto:0:1}$p"
+                ci=$(( ${cur[${k}i]:-0} - ${prev[${k}i]:-0} ))
+                co=$(( ${cur[${k}o]:-0} - ${prev[${k}o]:-0} ))
+                printf '%-7s %-5s %-14s %-14s %s\n' "$p" "$proto" "$(fmt_rate "$ci" "$dt")" "$(fmt_rate "$co" "$dt")" \
+                    "$( [[ $proto == tcp ]] && ss -Htn state established "( sport = :$p )" 2>/dev/null | wc -l || echo -)"
+            done
+        done
+        prev_t="$now"
+        prev=()
+        for k in "${!cur[@]}"; do prev[$k]="${cur[$k]}"; done
+    done
+}
+fmt_rate() {  # fmt_rate BYTES SECONDS
+    awk -v b="$1" -v t="$2" 'BEGIN { if (t <= 0) t = 1; r = b * 8 / t
+        if (r >= 1e9) printf "%.2f Gbit/s", r / 1e9; else if (r >= 1e6) printf "%.2f Mbit/s", r / 1e6
+        else if (r >= 1e3) printf "%.1f kbit/s", r / 1e3; else printf "%d bit/s", r }'
+}
+cmd_fwd_rebuild() {
+    legacy_guard
+    fwd_load
+    (( ${#F_LISTEN[@]} )) || { info "No rules; nothing to rebuild."; return 0; }
+    fwd_apply && units_sync && ok "Forwarder rebuilt from $RULES."
+}
+# Heal: configs equal to the generated ones, services running, ports open.
+fwd_heal() {
+    fwd_load
+    (( ${#F_LISTEN[@]} )) || return 0
+    have haproxy || (( ! $(fwd_count tcp) )) || { warn "heal: haproxy is not installed."; return 0; }
+    local tmp need=0
+    tmp=$(mktemp -d)
+    if fwd_build "$tmp" 2>/dev/null; then
+        if (( $(fwd_count tcp) )); then
+            cmp -s "$tmp/haproxy.cfg" "$HAPROXY_CFG" || need=1
+            svc_active haproxy || need=1
+        fi
+        if (( $(fwd_count udp) )); then
+            cmp -s "$tmp/udp.conf" "$UDP_CFG" || need=1
+            svc_active "$UDP_UNIT" || need=1
+        fi
+    fi
+    rm -rf "$tmp"
+    fwd_verify || need=1
+    if (( need )); then
+        jlog "heal: re-applying the forwarder"
+        fwd_apply || warn "heal: the forwarder could not be repaired."
+    fi
+    nft list table inet "$NFT_FWD" >/dev/null 2>&1 || counters_update
+}
+cmd_fwd_uninstall() {
+    fwd_load
+    confirm "Remove all forwarding rules and the forwarder services?" N || return 0
+    if (( ! DRY )) && [[ -f "$RULES" ]]; then fwd_backup >/dev/null; fi
+    svc_down "$UDP_UNIT"
+    if (( ! TEST_MODE )); then
+        remove_file "$SYSTEMD_DIR/$UDP_UNIT.service"
+    fi
+    remove_file "$UDP_CFG"
+    if [[ "$(haproxy_cfg_owner)" == ours ]]; then
+        if [[ -f "$HAPROXY_ORIG" ]]; then
+            run cp -a "$HAPROXY_ORIG" "$HAPROXY_CFG"
+            info "Original haproxy.cfg restored."
+            if (( ! TEST_MODE )) && svc_active haproxy; then run systemctl restart haproxy || true; fi
+        else
+            svc_down haproxy
+            remove_file "$HAPROXY_CFG"
+        fi
+    fi
+    remove_file "$HAPROXY_DROPIN"
+    daemon_reload
+    remove_file "$RULES"
+    if nft list table inet "$NFT_FWD" >/dev/null 2>&1; then run nft delete table inet "$NFT_FWD"; fi
+    if (( PURGE )); then
+        if [[ -f "$ETC/.installed-nginx" ]]; then
+            run env DEBIAN_FRONTEND=noninteractive apt-get purge -y -q nginx nginx-common libnginx-mod-stream || true
+            remove_file "$ETC/.installed-nginx"
+        fi
+        if [[ -f "$ETC/.installed-haproxy" ]]; then
+            run env DEBIAN_FRONTEND=noninteractive apt-get purge -y -q haproxy || true
+            remove_file "$ETC/.installed-haproxy"
+        fi
+    fi
+    units_sync
+    ok "Forwarder removed (backups stay in $FWD_BK)."
+}
+
+# ======================================================================
+# Section 3: PasarGuard WireGuard node -> GRE -> foreign exit
+# ======================================================================
+# Iran:    /etc/gretun/pg/<node>.conf  (node .env edited, IPv6 policy routing)
+# Foreign: /etc/gretun/exit/<tunnel>.conf (forwarding, MASQUERADE, return routes)
+PG_KEYS=(NODE NODE_DIR ENV_FILE CLI CONTAINER TUNNEL TABLE PREF WG_IF V4_SUBNETS V6_SUBNETS)
+PG_ENV_KEYS=(PG_NODE_WG_HOST_ROUTING PG_NODE_WG_NAT_OUTPUT_INTERFACE PG_NODE_WG_NAT_EGRESS_ONLY
+    PG_NODE_WG_NAT_DISABLE PG_NODE_WG_ROUTE_TABLE PG_NODE_WG_ROUTE_OUT_INTERFACE)
+EXIT_KEYS=(TUNNEL V4_SUBNETS V6_SUBNETS WAN4 WAN6)
+
+# ---------------------------------------------------------------- .env editing
+env_has() { grep -qE "^[[:space:]]*$2[[:space:]]*=" "$1" 2>/dev/null; }
+env_get() {
+    awk -v k="$2" '{ line = $0; sub(/^[[:space:]]+/, "", line)
+        if (index(line, k) == 1) { rest = substr(line, length(k) + 1); sub(/^[[:space:]]*/, "", rest)
+            if (substr(rest, 1, 1) == "=") { v = substr(rest, 2); gsub(/^[[:space:]"'\'']+|[[:space:]"'\'']+$/, "", v); val = v } } }
+        END { printf "%s", val }' "$1"
+}
+# env_set FILE KEY VALUE: edits in place and keeps comments. An active line
+# is replaced (later duplicates are commented out, as the last one would win);
+# otherwise the value goes right below a commented "# KEY=" or at the end.
+env_set() {
+    local f="$1" k="$2" v="$3" mode=append tmp
+    if env_has "$f" "$k"; then mode=replace
+    elif grep -qE "^[[:space:]]*#[[:space:]]*${k}[[:space:]]*=" "$f"; then mode=after; fi
+    if (( DRY )); then printf '%s[dry-run]%s %s: %s=%s\n' "$DIM" "$NC" "$f" "$k" "$v"; return 0; fi
+    tmp=$(mktemp)
+    awk -v k="$k" -v v="$v" -v mode="$mode" '
+        BEGIN { done = 0; act = "^[[:space:]]*" k "[[:space:]]*="; com = "^[[:space:]]*#[[:space:]]*" k "[[:space:]]*=" }
+        mode == "replace" && $0 ~ act { if (!done) { print k "=" v; done = 1 } else print "# " $0 "  # duplicate, disabled by gretun"; next }
+        { print }
+        mode == "after" && !done && $0 ~ com { print k "=" v; done = 1 }
+        END { if (mode == "append") { print k "=" v } }' "$f" >"$tmp"
+    if [[ "$mode" == append ]] && ! grep -q '^# gretun: PasarGuard WireGuard via GRE' "$f"; then
+        # Put a header above the first appended key.
+        awk -v k="$k" 'BEGIN { act = "^" k "=" } $0 ~ act && !h { print ""; print "# gretun: PasarGuard WireGuard via GRE"; h = 1 } { print }' \
+            "$tmp" >"$tmp.2" && mv -f "$tmp.2" "$tmp"
+    fi
+    cat "$tmp" >"$f"   # keeps owner and mode of the original
+    rm -f "$tmp"
+}
+env_unset() {  # removes active KEY= lines
+    (( DRY )) && { printf '%s[dry-run]%s %s: remove %s\n' "$DIM" "$NC" "$1" "$2"; return 0; }
+    local tmp
+    tmp=$(mktemp)
+    grep -vE "^[[:space:]]*$2[[:space:]]*=" "$1" >"$tmp" || true
+    cat "$tmp" >"$1"
+    rm -f "$tmp"
+}
+env_backup() {  # env_backup NODE FILE
+    (( DRY )) && return 0
+    local d="$BK/pg/$1"
+    mkdir -p "$d"
+    [[ -f "$d/env.original" ]] || cp -a "$2" "$d/env.original"
+    cp -a "$2" "$d/env.$(date +%Y%m%d-%H%M%S)"
+    find "$d" -maxdepth 1 -name 'env.2*' | sort -r | tail -n +"$((BACKUP_KEEP + 1))" | xargs -r rm -f --
+}
+
+# ---------------------------------------------------------------- node discovery
+compose_file() {
+    local f
+    for f in docker-compose.yml docker-compose.yaml compose.yml compose.yaml; do
+        if [[ -f "$1/$f" ]]; then printf '%s/%s' "$1" "$f"; return 0; fi
+    done
+    return 1
+}
+# Prints "name|dir|cli|container" for every PasarGuard node found.
+pg_detect() {
+    local d name cf cli cont seen=" "
+    for d in "$R"/opt/*/; do
+        d="${d%/}"
+        [[ -f "$d/.env" ]] || continue
+        cf=$(compose_file "$d" || true)
+        if ! { [[ -n "$cf" ]] && grep -qi 'pasarguard' "$cf"; } \
+            && ! grep -qE '^[[:space:]]*#?[[:space:]]*PG_NODE_' "$d/.env"; then continue; fi
+        name="${d##*/}"
+        cli=""
+        if have "$name"; then cli=$(command -v "$name"); elif [[ -x "$R/usr/local/bin/$name" ]]; then cli="$R/usr/local/bin/$name"; fi
+        cont=""
+        if have docker; then
+            cont=$(docker ps --format '{{.Names}}|{{.Label "com.docker.compose.project.working_dir"}}' 2>/dev/null \
+                | awk -F'|' -v d="$d" '$2 == d {print $1; exit}' || true)
+        fi
+        printf '%s|%s|%s|%s\n' "$name" "$d" "$cli" "$cont"
+        seen+="$d "
+    done
+    if have docker; then
+        docker ps --format '{{.Names}}|{{.Image}}|{{.Label "com.docker.compose.project.working_dir"}}' 2>/dev/null \
+            | awk -F'|' 'tolower($2) ~ /pasarguard\/node/' | while IFS='|' read -r cont _ d; do
+                [[ -n "$d" && "$seen" != *" $d "* && -f "$d/.env" ]] || continue
+                printf '%s|%s||%s\n' "${d##*/}" "$d" "$cont"
+            done
+    fi
+}
+wait_iface() {  # wait_iface NAME SECONDS
+    local i
+    for (( i = 0; i < $2; i++ )); do iface_exists "$1" && return 0; sleep 1; done
+    return 1
+}
+# Restarts a node so it re-reads .env. "<name> restart" follows the logs
+# forever, so it runs in its own process group and is stopped once the node
+# has logged its routing line (or after 90 s).
+pg_restart() {  # pg_restart DIR NAME CLI CONTAINER WG_IF
+    local dir="$1" name="$2" cli="$3" cont="$4" wg="${5:-wg0}" log="$RUNDIR/pg-$2.log" pid i cf
+    (( DRY )) && { printf '%s[dry-run]%s restart PasarGuard node %s\n' "$DIM" "$NC" "$name"; return 0; }
+    mkdir -p "$RUNDIR"
+    : >"$log"
+    if [[ -n "$cli" && -x "$cli" ]]; then
+        info "Restarting the node with '$name restart' (stopped automatically, log: $log)..."
+        setsid "$cli" restart </dev/null >"$log" 2>&1 &
+        pid=$!
+        for (( i = 0; i < 90; i++ )); do
+            sleep 1
+            kill -0 "$pid" 2>/dev/null || break
+            if grep -q 'policy routing' "$log" && iface_exists "$wg"; then sleep 2; break; fi
+        done
+        kill -TERM -- "-$pid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null || true
+    elif cf=$(compose_file "$dir") && have docker; then
+        info "Recreating the node container (docker compose up -d --force-recreate)..."
+        if docker compose version >/dev/null 2>&1; then
+            (cd "$dir" && timeout 180 docker compose -f "$cf" up -d --force-recreate) >"$log" 2>&1 || warn "docker compose failed; see $log"
+        else
+            (cd "$dir" && timeout 180 docker-compose -f "$cf" up -d --force-recreate) >"$log" 2>&1 || warn "docker-compose failed; see $log"
+        fi
+    else
+        warn "Cannot restart node $name automatically (no '$name' command and no docker compose). Restart it yourself."
+        return 1
+    fi
+    wait_iface "$wg" 30 || true
+    if [[ -n "$cont" ]] && have docker; then docker logs --tail 300 "$cont" >>"$log" 2>&1 || true; fi
+    return 0
+}
+pg_node_log() {  # pg_node_log NODE CONTAINER
+    cat "$RUNDIR/pg-$1.log" 2>/dev/null || true
+    if [[ -n "$2" ]] && have docker; then docker logs --tail 500 "$2" 2>&1 || true; fi
+}
+
+# ---------------------------------------------------------------- exit key
+exit_key() {  # exit_key TUNNEL V4 V6 (Iran side)
+    local body
+    body="e1|$(conf_val "$TUN_DIR/$1.conf" IN4_LOCAL)|$(conf_val "$TUN_DIR/$1.conf" IN6_LOCAL)|${2// /,}|${3// /,}"
+    printf '%s%s' "$EXIT_PREFIX" "$(printf '%s|%s' "$body" "$(crc "$body")" | b64u_enc)"
+}
+E_IN4="" E_IN6="" E_V4="" E_V6=""
+exit_key_decode() {
+    local s="${1//[[:space:]]/}" raw v a b c d e f x
+    raw=$(b64u_dec "${s#"$EXIT_PREFIX"}") || return 1
+    IFS='|' read -r v a b c d e f <<<"$raw"
+    [[ "$v" == e1 && -z "$f" && "$e" == "$(crc "e1|$a|$b|$c|$d")" ]] || return 1
+    is_ipv4 "$a" || return 1
+    E_IN4="$a" E_IN6="$b" E_V4="${c//,/ }" E_V6="${d//,/ }"
+    for x in $E_V4; do is_cidr4 "$x" || return 1; done
+    for x in $E_V6; do is_cidr6 "$x" || return 1; done
+}
+ask_subnets() {  # ask_subnets VAR 4|6 FLAGVALUE "prompt" DEFAULT [optional]
+    local __a __x __out __ok
+    while :; do
+        if [[ -n "$3" ]]; then __a="$3"; else ask __a "$4" "${5:-${6:+none}}"; fi
+        [[ "$__a" == none ]] && __a=""
+        __out="" __ok=1
+        for __x in $(split_list "$__a"); do
+            if [[ "$2" == 4 ]] && is_cidr4 "$__x"; then __out+="$(cidr_norm "$__x") "
+            elif [[ "$2" == 6 ]] && is_cidr6 "$__x"; then __out+="$(cidr_norm "$__x") "
+            else __ok=0; fi
+        done
+        if (( __ok )) && { [[ -n "$__out" ]] || [[ -n "${6:-}" ]]; }; then
+            printf -v "$1" '%s' "${__out% }"
+            return 0
+        fi
+        [[ -n "$3" ]] && die "Invalid IPv$2 subnet list: $3"
+        (( ASSUME_YES || ! HAVE_TTY )) && die "Missing or invalid IPv$2 subnets (use --v$2)."
+        warn "Enter IPv$2 networks such as $( [[ $2 == 4 ]] && echo 10.0.0.0/16 || echo fd10:10::/64 )."
+    done
+}
+alloc_table() {
+    local t used
+    used=$( { ip -4 rule show; ip -6 rule show; } 2>/dev/null | awk '{for (i = 1; i < NF; i++) if ($i == "lookup") print $(i + 1)}'
+        cat "$PG_DIR"/*.conf 2>/dev/null | awk -F= '$1 == "TABLE" {print $2}')
+    for (( t = 1470; t < 1500; t++ )); do
+        grep -qx "$t" <<<"$used" && continue
+        [[ -z "$(ip -4 route show table "$t" 2>/dev/null)$(ip -6 route show table "$t" 2>/dev/null)" ]] || continue
+        printf '%s' "$t"
+        return 0
+    done
+    die "No free routing table in 1470-1499; pass --table N."
+}
+alloc_pref() {  # alloc_pref NODE: keeps the node's pref, else the next free block of 10
+    local p f used=""
+    if [[ -f "$PG_DIR/$1.conf" ]]; then conf_val "$PG_DIR/$1.conf" PREF; return 0; fi
+    for f in "$PG_DIR"/*.conf; do used+=" $(conf_val "$f" PREF)"; done
+    for (( p = PREF_MIN; p + 9 <= PREF_MAX; p += 10 )); do
+        [[ " $used " == *" $p "* ]] || { printf '%s' "$p"; return 0; }
+    done
+    die "Too many PasarGuard nodes."
+}
+
+# ---------------------------------------------------------------- Iran: setup
+cmd_pg_setup() {
+    legacy_guard
+    need_base
+    local nodes line name dir cli cont c tun v4 v6 tbl pref wg env k
+    nodes=$(pg_detect)
+    if [[ -n "$O_NODE_DIR" ]]; then
+        [[ -f "$O_NODE_DIR/.env" ]] || die "$O_NODE_DIR/.env not found."
+        name="${O_NODE:-$(basename "$O_NODE_DIR")}" dir="${O_NODE_DIR%/}" cli="" cont=""
+        if have "$name"; then cli=$(command -v "$name"); fi
+    else
+        [[ -n "$nodes" ]] || die "No PasarGuard node found (looked in /opt/*/.env and docker). Use --node-dir /opt/NAME."
+        if [[ -n "$O_NODE" ]]; then
+            line=$(awk -F'|' -v n="$O_NODE" '$1 == n' <<<"$nodes" | head -n1)
+            [[ -n "$line" ]] || die "Node $O_NODE not found. Found: $(cut -d'|' -f1 <<<"$nodes" | paste -sd' ' -)"
+        else
+            local -a opts=()
+            while IFS='|' read -r name dir cli cont; do opts+=("$name  ($dir${cont:+, container $cont})"); done <<<"$nodes"
+            if (( ${#opts[@]} == 1 && (ASSUME_YES || ! HAVE_TTY) )); then c=1
+            else choose c "Which PasarGuard node?" "${opts[@]}"; (( c > 0 )) || return 0; fi
+            line=$(sed -n "${c}p" <<<"$nodes")
+        fi
+        IFS='|' read -r name dir cli cont <<<"$line"
+    fi
+    env="$dir/.env"
+    pick_tunnel tun iran
+    tun_load "$tun" || die "Unknown tunnel: $tun"
+    [[ "${C[ROLE]}" == iran ]] || die "Tunnel $tun is a foreign-side tunnel; use an Iran-side one."
+    local old=""
+    if [[ -f "$PG_DIR/$name.conf" ]]; then old="$PG_DIR/$name.conf"; fi
+    printf '\nWireGuard client subnets: exactly what the panel core uses in its Address field.\n'
+    ask_subnets v4 4 "$O_V4" "Client IPv4 subnet(s), e.g. 10.0.0.0/16" "$(conf_val "${old:-/dev/null}" V4_SUBNETS)"
+    if [[ -z "$O_V6" && -n "$O_V4" ]] && (( ASSUME_YES || ! HAVE_TTY )); then v6=""
+    else ask_subnets v6 6 "$O_V6" "Client IPv6 subnet(s), e.g. fd10:10::/64 (or 'none')" "$(conf_val "${old:-/dev/null}" V6_SUBNETS)" optional; fi
+    local x net4 net6
+    net4=$(cidr_norm "$(conf_val "$TUN_DIR/$tun.conf" IN4_LOCAL)/$(conf_val "$TUN_DIR/$tun.conf" IN4_PREFIX 30)")
+    net6=$(cidr_norm "$(conf_val "$TUN_DIR/$tun.conf" IN6_LOCAL)/64")
+    for x in $v4; do cidr_overlap "$x" "$net4" && die "$x overlaps the tunnel network $net4."; done
+    for x in $v6; do cidr_overlap "$x" "$net6" && die "$x overlaps the tunnel network $net6."; done
+    wg="${O_WG_IF:-$(conf_val "${old:-/dev/null}" WG_IF wg0)}"
+    tbl="${O_TABLE:-$(conf_val "${old:-/dev/null}" TABLE)}"
+    [[ -n "$tbl" ]] || tbl=$(alloc_table)
+    [[ "$tbl" =~ ^[0-9]+$ ]] && (( tbl > 0 && tbl < 252 || tbl > 255 )) || die "Invalid table number: $tbl"
+    pref=$(alloc_pref "$name")
+
+    section "PasarGuard node $name via $tun"
+    cat <<EOF
+  node .env:      $env
+  tunnel:         $tun (inner ${C[IN4_LOCAL]} / ${C[IN6_LOCAL]})
+  client subnets: ${v4} ${v6:-}
+  routing table:  $tbl   WireGuard interface: $wg
+  .env values:    PG_NODE_WG_HOST_ROUTING=1  PG_NODE_WG_NAT_OUTPUT_INTERFACE=$tun
+                  PG_NODE_WG_NAT_EGRESS_ONLY=0  PG_NODE_WG_NAT_DISABLE=0
+                  PG_NODE_WG_ROUTE_TABLE=$tbl  PG_NODE_WG_ROUTE_OUT_INTERFACE=$tun
+EOF
+    confirm "Apply (the node restarts; clients reconnect within seconds)?" Y || return 0
+
+    rb_begin "PasarGuard $name via $tun"
+    rb_save_file "$env"
+    rb_after "$SELF" pg-restart "$dir" "$name" "$cli" "$cont" "$wg"
+    env_backup "$name" "$env"
+    C=([NODE]="$name" [NODE_DIR]="$dir" [ENV_FILE]="$env" [CLI]="$cli" [CONTAINER]="$cont" [TUNNEL]="$tun"
+        [TABLE]="$tbl" [PREF]="$pref" [WG_IF]="$wg" [V4_SUBNETS]="$v4" [V6_SUBNETS]="$v6")
+    local -a keys=("${PG_KEYS[@]}")
+    for k in "${PG_ENV_KEYS[@]}"; do
+        # Old values are remembered once, so "pg remove" can put them back.
+        if [[ -n "$old" ]]; then C[PREV_$k]=$(conf_val "$old" "PREV_$k" __unset__)
+        elif env_has "$env" "$k"; then C[PREV_$k]=$(env_get "$env" "$k")
+        else C[PREV_$k]=__unset__; fi
+        keys+=("PREV_$k")
+    done
+    write_file "$PG_DIR/$name.conf" 640 "$(conf_text "${keys[@]}")" || true
+    env_set "$env" PG_NODE_WG_HOST_ROUTING 1
+    env_set "$env" PG_NODE_WG_NAT_OUTPUT_INTERFACE "$tun"
+    env_set "$env" PG_NODE_WG_NAT_EGRESS_ONLY 0
+    env_set "$env" PG_NODE_WG_NAT_DISABLE 0
+    env_set "$env" PG_NODE_WG_ROUTE_TABLE "$tbl"
+    env_set "$env" PG_NODE_WG_ROUTE_OUT_INTERFACE "$tun"
+    ok ".env updated (backup in $BK/pg/$name)."
+    sync_all || warn "Some parts could not be applied yet."
+    pg_restart "$dir" "$name" "$cli" "$cont" "$wg" || true
+    if iface_exists "$wg"; then offload_apply "$wg"
+    else
+        warn "$wg does not exist yet. It appears when the panel sends the WireGuard core to this node;"
+        hint "gretun finishes the IPv6 routes and offload settings automatically then (udev + heal timer)."
+    fi
+    sync_all quiet || true
+    pg_verify "$name" || true
+    section "Exit key for the foreign server"
+    printf '%s%s%s\n' "$GREEN$BOLD" "$(exit_key "$tun" "$v4" "$v6")" "$NC"
+    printf 'On the foreign server run:  gretun exit add --key <the key above>\n'
+    printf '(menu: 3) PasarGuard -> 2) Foreign server: add the exit)\n'
+    pg_panel_help "$v4" "$v6"
+    rb_arm 600
+}
+pg_panel_help() {  # pg_panel_help V4 V6
+    section "Still to do in the PasarGuard panel"
+    cat <<EOF
+  1. Core config -> WireGuard -> Address: ${1// /, }${2:+, ${2// /, }}
+     (both subnets, otherwise clients get no IPv6)
+  2. Hosts -> the WireGuard host -> MTU: 1420
+     (field test Iran <-> DE: MTU 1280 gave ~1 Mbps upload, 1420 gave ~120 Mbps)
+  3. AllowedIPs for clients: 0.0.0.0/0, ::/0
+  Clients must download their config again after these changes.
+EOF
+}
+# ---------------------------------------------------------------- Iran: verify
+pg_verify() {  # pg_verify NODE
+    local f="$PG_DIR/$1.conf" fails=0 t tbl wg v6 out k want
+    conf_load "$f" || { err "No gretun setup for node $1."; return 1; }
+    t=$(cget TUNNEL) tbl=$(cget TABLE) wg=$(cget WG_IF wg0) v6=$(cget V6_SUBNETS)
+    local env cont
+    env=$(cget ENV_FILE) cont=$(cget CONTAINER)
+    section "Check: node $1 via $t"
+    local p4 p6
+    p4=$(conf_val "$TUN_DIR/$t.conf" IN4_PEER) p6=$(conf_val "$TUN_DIR/$t.conf" IN6_PEER)
+    if ping_peer "$p4" 3; then ok "Tunnel ping $p4: ${PING_RTT} ms, ${PING_LOSS}% loss"
+    else err "Tunnel ping $p4 failed"; hint "Run 'gretun doctor' on both servers."; fails=$((fails + 1)); fi
+    if [[ -n "$p6" ]]; then
+        if ping_peer "$p6" 3; then ok "Tunnel ping $p6 (IPv6): ${PING_RTT} ms"
+        else warn "Tunnel IPv6 ping $p6 failed"; fails=$((fails + 1)); fi
+    fi
+    for k in "${PG_ENV_KEYS[@]}"; do
+        case "$k" in
+            PG_NODE_WG_HOST_ROUTING) want=1 ;; PG_NODE_WG_NAT_EGRESS_ONLY|PG_NODE_WG_NAT_DISABLE) want=0 ;;
+            PG_NODE_WG_ROUTE_TABLE) want="$tbl" ;; *) want="$t" ;;
+        esac
+        [[ "$(env_get "$env" "$k")" == "$want" ]] || { err ".env: $k is not $want"; fails=$((fails + 1)); }
+    done
+    out=$(ip -4 rule show 2>/dev/null | grep -E "iif $wg .*lookup $tbl" || true)
+    if [[ -n "$out" ]]; then ok "ip rule (node): ${out//$'\t'/ }"
+    else warn "ip rule: no 'iif $wg lookup $tbl' yet (the node adds it once $wg exists)"; fails=$((fails + 1)); fi
+    if [[ -n "$v6" ]]; then
+        out=$(ip -6 rule show 2>/dev/null | grep -E "lookup $tbl" || true)
+        if [[ -n "$out" ]]; then ok "ip -6 rule (gretun): $(tr '\t\n' '  ' <<<"$out")"
+        else err "ip -6 rule for $v6 missing"; fails=$((fails + 1)); fi
+    fi
+    out=$(ip -4 route show table "$tbl" 2>/dev/null)
+    if grep -q "^default dev $t" <<<"$out"; then ok "table $tbl (IPv4): default dev $t"
+    else err "table $tbl (IPv4) has no 'default dev $t'"; fails=$((fails + 1)); fi
+    if [[ -n "$v6" ]]; then
+        out=$(ip -6 route show table "$tbl" 2>/dev/null)
+        if grep -q "^default dev $t" <<<"$out"; then ok "table $tbl (IPv6): default dev $t"
+        else err "table $tbl (IPv6) has no 'default dev $t'"; fails=$((fails + 1)); fi
+    fi
+    if pg_node_log "$1" "$cont" | grep -qE "policy routing iif $wg -> table $tbl default dev $t"; then
+        ok "node log: policy routing iif $wg -> table $tbl default dev $t"
+    else
+        warn "node log line 'policy routing iif $wg -> table $tbl default dev $t' not seen"
+        hint "Check the node logs ('$1 logs'); an old node version may not support these .env keys."
+        fails=$((fails + 1))
+    fi
+    ok "offload $t: $(offload_state "$t")"
+    if iface_exists "$wg"; then
+        out=$(offload_state "$wg")
+        if [[ "$out" == *on* ]]; then warn "offload $wg: $out"; fails=$((fails + 1)); else ok "offload $wg: $out"; fi
+    else
+        warn "$wg does not exist yet"
+    fi
+    [[ "$(sysctl_get net.ipv6.conf.all.forwarding)" == 1 && "$(sysctl_get net.ipv4.ip_forward)" == 1 ]] \
+        && ok "forwarding on (IPv4 + IPv6)" || { err "forwarding is off"; fails=$((fails + 1)); }
+    C=()
+    if (( fails == 0 )); then ok "All checks passed."; else warn "$fails check(s) need attention."; fi
+    (( fails == 0 ))
+}
+cmd_pg_status() {
+    local f n=0
+    for f in "$PG_DIR"/*.conf; do pg_verify "$(basename "$f" .conf)" || true; n=1; done
+    for f in "$EXIT_DIR"/*.conf; do exit_verify "$(basename "$f" .conf)" || true; n=1; done
+    (( n )) || info "No PasarGuard or exit setup on this server."
+}
+cmd_pg_panel() {
+    local f n=0
+    for f in "$PG_DIR"/*.conf; do
+        pg_panel_help "$(conf_val "$f" V4_SUBNETS)" "$(conf_val "$f" V6_SUBNETS)"
+        n=1
+    done
+    (( n )) || pg_panel_help "10.0.0.0/16" "fd10:10::/64"
+}
+cmd_pg_key() {
+    local f
+    for f in "$PG_DIR"/*.conf; do
+        printf '%s: %s\n' "$(basename "$f" .conf)" \
+            "$(exit_key "$(conf_val "$f" TUNNEL)" "$(conf_val "$f" V4_SUBNETS)" "$(conf_val "$f" V6_SUBNETS)")"
+    done
+}
+cmd_pg_remove() {
+    local name="${ARGS[0]:-$O_NODE}" f k v env
+    if [[ -z "$name" ]]; then
+        local -a l=()
+        for f in "$PG_DIR"/*.conf; do l+=("$(basename "$f" .conf)"); done
+        (( ${#l[@]} )) || die "No PasarGuard setup to remove."
+        local c
+        choose c "Remove which node setup?" "${l[@]}"
+        (( c > 0 )) || return 0
+        name="${l[c - 1]}"
+    fi
+    f="$PG_DIR/$name.conf"
+    conf_load "$f" || die "No gretun setup for node $name."
+    env=$(cget ENV_FILE)
+    confirm "Undo the gretun settings of node $name (its .env keys go back to their old values)?" N || return 0
+    local dir cli cont wg
+    dir=$(cget NODE_DIR) cli=$(cget CLI) cont=$(cget CONTAINER) wg=$(cget WG_IF wg0)
+    rb_begin "remove PasarGuard $name"
+    rb_save_file "$env"
+    rb_after "$SELF" pg-restart "$dir" "$name" "$cli" "$cont" "$wg"
+    env_backup "$name" "$env"
+    for k in "${PG_ENV_KEYS[@]}"; do
+        v=$(cget "PREV_$k" __unset__)
+        if [[ "$v" == __unset__ ]]; then env_unset "$env" "$k"; else env_set "$env" "$k" "$v"; fi
+    done
+    remove_file "$f"
+    sync_all quiet || true
+    pg_restart "$dir" "$name" "$cli" "$cont" "$wg" || true
+    ok "Node $name is back to its own settings."
+    rb_arm 300
+}
+
+# ---------------------------------------------------------------- foreign: exit
+cmd_exit_add() {
+    legacy_guard
+    need_base
+    local key="$O_KEY" tun="" v4 v6 n c
+    if [[ -z "$key" && -z "$O_V4" ]]; then
+        choose c "Exit for a PasarGuard node" "Paste the exit key printed on the Iran server" "Enter the subnets manually"
+        case "$c" in 1) ask key "Exit key" ;; 2) ;; *) return 0 ;; esac
+    fi
+    if [[ -n "$key" ]]; then
+        exit_key_decode "$key" || die "This exit key is not valid (copy it again, completely)."
+        for n in $(tun_list); do
+            [[ "$(conf_val "$TUN_DIR/$n.conf" ROLE)" == foreign && "$(conf_val "$TUN_DIR/$n.conf" IN4_PEER)" == "$E_IN4" ]] && tun="$n"
+        done
+        [[ -n "$tun" ]] || die "No foreign-side tunnel has the Iran inner address $E_IN4. Create the tunnel first (section 1)."
+        v4="$E_V4" v6="$E_V6"
+        if [[ -n "$E_IN6" && "$(conf_val "$TUN_DIR/$tun.conf" IN6_PEER)" != "$E_IN6" ]]; then
+            warn "The Iran inner IPv6 in the key ($E_IN6) differs from tunnel $tun; IPv6 return routes may not work."
+        fi
+    else
+        pick_tunnel tun foreign
+        ask_subnets v4 4 "$O_V4" "Client IPv4 subnet(s) of the Iran node, e.g. 10.0.0.0/16" ""
+        if [[ -z "$O_V6" && -n "$O_V4" ]] && (( ASSUME_YES || ! HAVE_TTY )); then v6=""
+        else ask_subnets v6 6 "$O_V6" "Client IPv6 subnet(s), e.g. fd10:10::/64 (or 'none')" "" optional; fi
+    fi
+    tun_load "$tun" || die "Unknown tunnel $tun."
+    [[ "${C[ROLE]}" == foreign ]] || die "Tunnel $tun is an Iran-side tunnel."
+    local wan4="${O_WAN:-auto}" wan6="${O_WAN:-auto}"
+    section "Exit through $tun"
+    cat <<EOF
+  WAN interface:  IPv4 $( [[ $wan4 == auto ]] && wan_if 4 || echo "$wan4" )   IPv6 $( [[ $wan6 == auto ]] && wan_if 6 || echo "$wan6" )
+  MASQUERADE:     $(cidr_norm "${C[IN4_LOCAL]}/${C[IN4_PREFIX]}") $v4 $(cidr_norm "${C[IN6_LOCAL]}/64") $v6
+  return routes:  $v4 via ${C[IN4_PEER]}   ${v6:+$v6 via ${C[IN6_PEER]}}
+  forwarding:     on (accept_ra=2 on the WAN first, so its IPv6 stays)
+EOF
+    [[ -n "$(wan_if 6)" || "$wan6" != auto ]] || warn "This server has no IPv6 default route: clients will get no IPv6."
+    confirm "Apply?" Y || return 0
+    rb_begin "exit via $tun"
+    C=([TUNNEL]="$tun" [V4_SUBNETS]="$v4" [V6_SUBNETS]="$v6" [WAN4]="$wan4" [WAN6]="$wan6")
+    write_file "$EXIT_DIR/$tun.conf" 640 "$(conf_text "${EXIT_KEYS[@]}")" || true
+    sync_all || warn "Some parts could not be applied."
+    exit_verify "$tun" || true
+    rb_arm 600
+}
+exit_verify() {  # exit_verify TUNNEL
+    local f="$EXIT_DIR/$1.conf" fails=0 t s w out p4
+    conf_load "$f" || { err "No exit for $1."; return 1; }
+    t=$(cget TUNNEL)
+    local v4 v6
+    v4=$(cget V4_SUBNETS) v6=$(cget V6_SUBNETS)
+    C=()
+    section "Check: exit via $t"
+    p4=$(conf_val "$TUN_DIR/$t.conf" IN4_PEER)
+    if ping_peer "$p4" 3; then ok "Tunnel ping $p4: ${PING_RTT} ms"; else err "Tunnel ping $p4 failed"; fails=$((fails + 1)); fi
+    [[ "$(sysctl_get net.ipv4.ip_forward)" == 1 ]] && ok "IPv4 forwarding on" || { err "IPv4 forwarding off"; fails=$((fails + 1)); }
+    [[ "$(sysctl_get net.ipv6.conf.all.forwarding)" == 1 ]] && ok "IPv6 forwarding on" || { err "IPv6 forwarding off"; fails=$((fails + 1)); }
+    w=$(wan_if 6)
+    if [[ -n "$w" ]]; then
+        out=$(sysctl_get "net/ipv6/conf/$w/accept_ra")
+        if [[ "$out" == 1 ]]; then err "accept_ra on $w is 1: IPv6 from RA will be lost"; fails=$((fails + 1))
+        else ok "accept_ra on $w: $out"; fi
+        if [[ -n "$(ip -6 route show default 2>/dev/null)" ]]; then ok "IPv6 default route present"
+        else err "no IPv6 default route"; fails=$((fails + 1)); fi
+    fi
+    for s in $v4; do
+        out=$(ip -4 route show "$s" 2>/dev/null)
+        [[ "$out" == *"dev $t"* ]] && ok "route $s -> $t" || { err "route $s via $t missing"; fails=$((fails + 1)); }
+    done
+    for s in $v6; do
+        out=$(ip -6 route show "$s" 2>/dev/null)
+        [[ "$out" == *"dev $t"* ]] && ok "route $s -> $t" || { err "route $s via $t missing"; fails=$((fails + 1)); }
+    done
+    if nft list table ip "${NFT_T}_nat" >/dev/null 2>&1; then ok "NAT: table ip ${NFT_T}_nat present"
+    else err "NAT table missing"; fails=$((fails + 1)); fi
+    if [[ -n "$v6" ]]; then
+        nft list table ip6 "${NFT_T}_nat" >/dev/null 2>&1 && ok "NAT: table ip6 ${NFT_T}_nat present" \
+            || { err "IPv6 NAT table missing"; fails=$((fails + 1)); }
+    fi
+    if (( fails == 0 )); then ok "All checks passed."; else warn "$fails check(s) need attention."; fi
+    (( fails == 0 ))
+}
+cmd_exit_list() {
+    local f n=0
+    for f in "$EXIT_DIR"/*.conf; do
+        printf '%s: v4 %s  v6 %s  wan %s/%s\n' "$(conf_val "$f" TUNNEL)" "$(conf_val "$f" V4_SUBNETS -)" \
+            "$(conf_val "$f" V6_SUBNETS -)" "$(conf_val "$f" WAN4 auto)" "$(conf_val "$f" WAN6 auto)"
+        n=1
+    done
+    (( n )) || info "No exits configured."
+}
+cmd_exit_remove() {
+    local t="${ARGS[0]:-$O_TUNNEL}"
+    if [[ -z "$t" ]]; then
+        local -a l=()
+        local f c
+        for f in "$EXIT_DIR"/*.conf; do l+=("$(basename "$f" .conf)"); done
+        (( ${#l[@]} )) || die "No exits configured."
+        choose c "Remove which exit?" "${l[@]}"
+        (( c > 0 )) || return 0
+        t="${l[c - 1]}"
+    fi
+    [[ -f "$EXIT_DIR/$t.conf" ]] || die "No exit for $t."
+    confirm "Remove the exit (NAT and routes) for $t?" N || return 0
+    rb_begin "remove exit $t"
+    remove_file "$EXIT_DIR/$t.conf"
+    sync_all
+    ok "Exit for $t removed (forwarding stays on until reboot)."
+    rb_arm 300
+}
+
+# ======================================================================
+# Extras: status, doctor, bench, tuning, alerts, install/uninstall
+# ======================================================================
+cmd_status() {
+    section "Tunnels"
+    tunnel_status
+    fwd_load
+    if (( ${#F_LISTEN[@]} )); then
+        section "IPv6 forwarder"
+        cmd_fwd_list
+    fi
+    local f any=0
+    for f in "$PG_DIR"/*.conf; do
+        (( any )) || section "PasarGuard (Iran side)"
+        any=1
+        printf '  node %s via %s, table %s, clients %s %s\n' "$(conf_val "$f" NODE)" "$(conf_val "$f" TUNNEL)" \
+            "$(conf_val "$f" TABLE)" "$(conf_val "$f" V4_SUBNETS)" "$(conf_val "$f" V6_SUBNETS)"
+    done
+    any=0
+    for f in "$EXIT_DIR"/*.conf; do
+        (( any )) || section "Exit (foreign side)"
+        any=1
+        printf '  via %s for %s %s\n' "$(conf_val "$f" TUNNEL)" "$(conf_val "$f" V4_SUBNETS)" "$(conf_val "$f" V6_SUBNETS)"
+    done
+    if rb_pending; then
+        local left=$(( $(cat "$RB_PENDING/deadline" 2>/dev/null || date +%s) - $(date +%s) ))
+        warn "Waiting for confirmation: $(cat "$RB_PENDING/label") (rollback in ${left}s). Run: gretun confirm"
+    fi
+}
+
+dr_ok() { printf '  %s[ok]%s %s\n' "$GREEN" "$NC" "$*"; }
+dr_bad() { printf '  %s[!!]%s %s\n' "$YELLOW" "$NC" "$*"; DR_ISSUES=$((DR_ISSUES + 1)); }
+dr_info() { printf '  %s[--]%s %s\n' "$DIM" "$NC" "$*"; }
+DR_ISSUES=0
+cmd_doctor() {
+    local n t w v out wgs
+    DR_ISSUES=0
+    section "System"
+    dr_info "gretun $VERSION, $(os_field PRETTY_NAME), kernel $(uname -r)"
+    if legacy_present; then dr_bad "haproxy-forwarder is still installed"; hint "Import it: gretun tunnel import legacy"; fi
+    if (( ! TEST_MODE )) && svc_enabled nftables.service; then
+        dr_bad "nftables.service is enabled: restarting it runs /etc/nftables.conf, which usually flushes ALL rules"
+        hint "gretun never needs it. The heal timer restores gretun's rules within a minute if that happens."
+    fi
+    if rb_pending; then dr_bad "A change waits for confirmation: $(cat "$RB_PENDING/label")"; hint "gretun confirm   or   gretun rollback"; fi
+
+    section "Tunnels"
+    if [[ -z "$(tun_list)" ]]; then dr_info "no tunnels"; fi
+    for n in $(tun_list); do
+        tun_load "$n" || continue
+        if ! iface_exists "$n"; then
+            dr_bad "$n: interface missing"
+            hint "gretun heal (or systemctl restart gretun@$n). For ip6gre: modprobe ip6_gre must work."
+            continue
+        fi
+        link_info "$n"
+        if (( LI_UP )); then dr_ok "$n: up ($LI_KIND ${C[LOCAL]} -> ${C[REMOTE]})"; else dr_bad "$n: down"; fi
+        [[ "$LI_MTU" == "${C[MTU]}" ]] && dr_ok "$n: mtu $LI_MTU" || dr_bad "$n: mtu $LI_MTU, configured ${C[MTU]}"
+        out=$(offload_state "$n")
+        [[ "$out" == *on* ]] && dr_bad "$n: offload $out (should be off)" || dr_ok "$n: offload $out"
+        local_has_addr "${C[LOCAL]}" || { dr_bad "$n: local address ${C[LOCAL]} is not on this server any more"
+            hint "If the server got a new IP: remove the tunnel and pair again."; }
+        if ping_peer "${C[IN4_PEER]}" 4; then
+            dr_ok "$n: ping ${C[IN4_PEER]} ${PING_RTT} ms, ${PING_LOSS}% loss"
+            if ! ping -n -q -c 1 -W 2 -M "do" -s $((C[MTU] - 28)) "${C[IN4_PEER]}" >/dev/null 2>&1; then
+                dr_bad "$n: full-size packets (MTU ${C[MTU]}) do not pass"
+                hint "Lower the MTU: remove and re-create the tunnel with --mtu $((C[MTU] - 40)) on both sides."
+            else
+                dr_ok "$n: full-size packets pass (MTU ${C[MTU]})"
+            fi
+        else
+            dr_bad "$n: no reply from ${C[IN4_PEER]}"
+            hint "Is the tunnel set up on the other server (gretun tunnel list there)?"
+            hint "Does the provider block GRE (protocol 47)? Is the other server's address still ${C[REMOTE]}?"
+        fi
+        if [[ -n "${C[IN6_PEER]:-}" ]]; then
+            if ping_peer "${C[IN6_PEER]}" 3; then dr_ok "$n: IPv6 ping ${C[IN6_PEER]} ${PING_RTT} ms"
+            else dr_bad "$n: no IPv6 reply from ${C[IN6_PEER]}"; hint "Update gretun on the other server and run 'gretun heal' there."; fi
+        fi
+        v=$(sysctl_get "net/ipv4/conf/$n/rp_filter")
+        [[ "$v" != 1 ]] && dr_ok "$n: rp_filter $v" || dr_bad "$n: rp_filter 1 (strict) can drop returning client traffic"
+    done
+
+    section "Firewall"
+    if nft list table inet "$NFT_T" >/dev/null 2>&1; then dr_ok "nft table inet $NFT_T (GRE accept, MSS clamp)"
+    elif [[ -n "$(tun_list)" ]]; then dr_bad "nft table inet $NFT_T missing"; hint "gretun heal"; fi
+    for t in iptables ip6tables; do
+        have "$t" || continue
+        if "$t" -w 5 -C INPUT -m comment --comment gretun -j GRETUN-IN >/dev/null 2>&1; then
+            dr_ok "$t: GRETUN-IN ($("$t" -w 5 -S GRETUN-IN 2>/dev/null | grep -c '^-A') rules), GRETUN-FWD ($("$t" -w 5 -S GRETUN-FWD 2>/dev/null | grep -c '^-A') rules)"
+        elif [[ -n "$(tun_list)" ]]; then dr_bad "$t: jump to GRETUN-IN missing"; hint "gretun heal"; fi
+    done
+    if ufw_active; then dr_info "ufw is active; gretun's chains are evaluated before ufw's."; fi
+    out=$(nft list ruleset 2>/dev/null | awk '/^table/ {tb = $2 " " $3} /policy drop/ && tb !~ /gretun/ && tb !~ /^(ip|ip6) (filter|nat|mangle|raw)$/ {print tb}' | sort -u)
+    if [[ -n "$out" ]]; then
+        dr_bad "native nftables chains with 'policy drop' outside gretun: $(paste -sd, <<<"$out")"
+        hint "An accept in gretun's table cannot override a drop elsewhere. Add 'meta l4proto 47 accept' and"
+        hint "'iifname \"gre*\" accept' to that table's input chain yourself."
+    fi
+    if nft list table ip "${NFT_T}_nat" >/dev/null 2>&1 || nft list table ip6 "${NFT_T}_nat" >/dev/null 2>&1; then
+        dr_ok "NAT: $(nft list table ip "${NFT_T}_nat" 2>/dev/null | grep -c masquerade) IPv4 + $(nft list table ip6 "${NFT_T}_nat" 2>/dev/null | grep -c masquerade) IPv6 masquerade rules"
+    fi
+
+    section "Routing"
+    out=$(ip -4 rule show | grep -vE '^(0|32766|32767):' || true)
+    [[ -n "$out" ]] && printf '%s\n' "$out" | sed 's/^/       ip rule     /'
+    out=$(ip -6 rule show | grep -vE '^(0|32766|32767):' || true)
+    [[ -n "$out" ]] && printf '%s\n' "$out" | sed 's/^/       ip -6 rule  /'
+    local f tbl
+    for f in "$PG_DIR"/*.conf; do
+        tbl=$(conf_val "$f" TABLE) t=$(conf_val "$f" TUNNEL)
+        out=$(ip -4 route show table "$tbl" 2>/dev/null)
+        grep -q "^default dev $t" <<<"$out" && dr_ok "table $tbl IPv4: default dev $t" \
+            || { dr_bad "table $tbl IPv4 has no 'default dev $t' (clients get 'unreachable')"; hint "Is $t up? gretun heal"; }
+        if [[ -n "$(conf_val "$f" V6_SUBNETS)" ]]; then
+            out=$(ip -6 route show table "$tbl" 2>/dev/null)
+            grep -q "^default dev $t" <<<"$out" && dr_ok "table $tbl IPv6: default dev $t" \
+                || dr_bad "table $tbl IPv6 has no 'default dev $t'"
+        fi
+    done
+    for w in $(printf '%s\n%s\n' "$(wan_if 4)" "$(wan_if 6)" | sed '/^$/d' | sort -u); do
+        v=$(sysctl_get "net/ipv6/conf/$w/accept_ra")
+        if [[ "$(sysctl_get net.ipv6.conf.all.forwarding)" == 1 && "$v" == 1 ]]; then
+            dr_bad "$w: accept_ra=1 with forwarding on: RA-learned IPv6 will be lost"
+            hint "sysctl -w net.ipv6.conf.$w.accept_ra=2   (gretun heal does this when PasarGuard/exit is set up)"
+        else
+            dr_info "$w: accept_ra=$v"
+        fi
+    done
+    dr_info "forwarding: ipv4=$(sysctl_get net.ipv4.ip_forward) ipv6=$(sysctl_get net.ipv6.conf.all.forwarding)"
+    [[ -n "$(ip -6 route show default 2>/dev/null)" ]] && dr_ok "IPv6 default route present" || dr_info "no IPv6 default route"
+
+    wgs=$(offload_ifaces | sed '/^$/d' | sort -u)
+    if [[ -n "$wgs" ]]; then
+        section "WireGuard"
+        for w in $wgs; do
+            if iface_exists "$w"; then
+                out=$(offload_state "$w")
+                [[ "$out" == *on* ]] && dr_bad "$w: offload $out" || dr_ok "$w: offload $out, mtu $(cat "/sys/class/net/$w/mtu")"
+            else
+                dr_info "$w: not present (the node creates it)"
+            fi
+        done
+        [[ -f "$UDEV_RULE" ]] && dr_ok "udev rule re-applies offload settings when $w is re-created"
+    fi
+
+    section "Services"
+    if (( ! TEST_MODE )); then
+        svc_active gretun-heal.timer && dr_ok "gretun-heal.timer active" || { [[ -z "$(tun_list)" ]] || dr_bad "gretun-heal.timer not active"; }
+        for n in $(tun_list); do
+            svc_active "gretun@$n.service" && dr_ok "gretun@$n active" || dr_bad "gretun@$n not active (starts at boot)"
+        done
+    fi
+    fwd_load
+    if (( $(fwd_count tcp) )); then svc_active haproxy && dr_ok "haproxy running" || dr_bad "haproxy stopped"; fi
+    if (( $(fwd_count udp) )); then svc_active "$UDP_UNIT" && dr_ok "$UDP_UNIT running" || dr_bad "$UDP_UNIT stopped"; fi
+    C=()
+    printf '\n'
+    if (( DR_ISSUES == 0 )); then ok "No problems found."; else warn "$DR_ISSUES item(s) need attention (see the hints above)."; fi
+}
+
+cmd_bench() {
+    local tun p secs="${O_TIME:-10}" out
+    need iperf3:iperf3
+    pick_tunnel tun
+    tun_load "$tun" || die "Unknown tunnel $tun"
+    if (( BENCH_SERVER )); then
+        info "iperf3 server on ${C[IN4_LOCAL]} (tunnel $tun). Now run 'gretun bench' on the other server. Ctrl+C to stop."
+        exec iperf3 -s -B "${C[IN4_LOCAL]}"
+    fi
+    p="${C[IN4_PEER]}"
+    ping_peer "$p" 2 || die "No reply from $p; is the tunnel up?"
+    quiet timeout 5 bash -c "exec 3<>/dev/tcp/$p/5201" || die "No iperf3 server on $p. Run 'gretun bench --server' on the other server first."
+    section "iperf3 over $tun to $p (${secs}s per test)"
+    local name args
+    for name in "1 stream, upload|" "16 streams, upload|-P 16" "1 stream, download|-R" "16 streams, download|-R -P 16"; do
+        args="${name#*|}"
+        # shellcheck disable=SC2086
+        out=$(iperf3 -c "$p" -B "${C[IN4_LOCAL]}" -t "$secs" -f m $args 2>&1) || true
+        printf '  %-22s %s\n' "${name%%|*}" "$(awk '/receiver/ {for (i = 1; i < NF; i++) if ($(i + 1) ~ /bits\/sec/) v = $i " " $(i + 1)} END {print (v ? v : "failed")}' <<<"$out")"
+        sleep 1
+    done
+    hint "Upload = from this server to the other. Low numbers with offload on? See: gretun doctor"
+}
+
+TUNE_KEYS=(net.core.default_qdisc=fq net.ipv4.tcp_congestion_control=bbr net.core.rmem_max=67108864
+    net.core.wmem_max=67108864 "net.ipv4.tcp_rmem=4096 131072 67108864" "net.ipv4.tcp_wmem=4096 65536 67108864"
+    net.core.netdev_max_backlog=16384 net.ipv4.tcp_mtu_probing=1 net.ipv4.tcp_slow_start_after_idle=0)
+cmd_tune() {
+    local kv k v content="$MARK
+# Optional tuning by gretun. Revert with: gretun tune revert"
+    case "${ARGS[0]:-show}" in
+        apply)
+            quiet modprobe tcp_bbr || true
+            local -a items=("${TUNE_KEYS[@]}")
+            if [[ -e /proc/sys/net/netfilter/nf_conntrack_max ]]; then
+                v=$(sysctl_get net.netfilter.nf_conntrack_max)
+                (( v < 262144 )) && v=262144
+                items+=("net.netfilter.nf_conntrack_max=$v")
+            fi
+            (( DRY )) || mkdir -p "$ETC"
+            for kv in "${items[@]}"; do
+                k="${kv%%=*}" v="${kv#*=}"
+                if [[ "$k" == net.ipv4.tcp_congestion_control ]] \
+                    && ! grep -qw bbr <<<"$(sysctl_get net.ipv4.tcp_available_congestion_control)"; then
+                    warn "BBR is not available in this kernel; skipped."
+                    continue
+                fi
+                sysctl_get "$k" >/dev/null || continue
+                if (( ! DRY )) && ! grep -q "^$k=" "$TUNE_PREV" 2>/dev/null; then
+                    printf '%s=%s\n' "$k" "$(sysctl_get "$k")" >>"$TUNE_PREV"
+                fi
+                run sysctl -q -w "$k=$v" >/dev/null || warn "Could not set $k"
+                content+=$'\n'"$k = $v"
+            done
+            write_file "$SYSCTL_TUNE" 644 "$content" || true
+            if grep -q 'tcp_congestion_control = bbr' <<<"$content"; then
+                write_file "$R/etc/modules-load.d/gretun-tune.conf" 644 "$MARK"$'\n'"tcp_bbr" || true
+            fi
+            ok "Tuning applied (BBR + fq, larger buffers, conntrack). Offloads on the physical NIC are not touched." ;;
+        revert)
+            if [[ -f "$TUNE_PREV" ]]; then
+                while IFS='=' read -r k v; do run sysctl -q -w "$k=$v" >/dev/null || true; done <"$TUNE_PREV"
+                remove_file "$TUNE_PREV"
+            fi
+            remove_file "$SYSCTL_TUNE"
+            remove_file "$R/etc/modules-load.d/gretun-tune.conf"
+            ok "Tuning reverted to the values from before 'gretun tune apply'." ;;
+        show)
+            for kv in "${TUNE_KEYS[@]}"; do k="${kv%%=*}"; printf '  %-40s %s\n' "$k" "$(sysctl_get "$k" || echo -)"; done
+            if [[ -f "$SYSCTL_TUNE" ]]; then info "Tuning is applied ($SYSCTL_TUNE)."; else info "Tuning is not applied."; fi ;;
+        *) die "Usage: gretun tune apply|revert|show" ;;
+    esac
+}
+
+cmd_alert() {
+    case "${ARGS[0]:-show}" in
+        set)
+            local url="${ARGS[1]:-$O_URL}"
+            [[ -n "$url" ]] || ask url "ntfy topic URL (e.g. https://ntfy.sh/my-secret-topic or your own server)"
+            [[ "$url" =~ ^https?:// ]] || die "The URL must start with http:// or https://"
+            need curl:curl
+            C=([NTFY_URL]="$url" [NTFY_TOKEN]="$O_TOKEN")
+            write_file "$ALERT_CONF" 600 "$(conf_text NTFY_URL NTFY_TOKEN)" || true
+            ok "Alerts go to $url (tunnel down/up, rollbacks)."
+            hint "Iran servers often cannot reach ntfy.sh; a self-hosted ntfy server works better there." ;;
+        test) alert "Test alert from gretun on $(hostname)" && ok "Sent." || err "Sending failed (is the URL reachable from this server?)" ;;
+        off) remove_file "$ALERT_CONF"; ok "Alerts off." ;;
+        show) if [[ -f "$ALERT_CONF" ]]; then info "Alerts: $(conf_val "$ALERT_CONF" NTFY_URL)"; else info "Alerts are off."; fi ;;
+        *) die "Usage: gretun alert set URL [--token T] | test | off" ;;
+    esac
+}
+
+self_install() {
+    (( TEST_MODE || DRY )) && return 0
+    local src
+    src=$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || true)
+    [[ -f "$src" && "$src" != "$INSTALL_PATH" ]] || return 0
+    if [[ ! -f "$INSTALL_PATH" ]] || ! cmp -s "$src" "$INSTALL_PATH"; then
+        install -m 755 "$src" "$INSTALL_PATH"
+        info "Installed as $INSTALL_PATH (run 'gretun' from now on)."
+    fi
+}
+cmd_uninstall() {
+    warn "This removes every tunnel, forwarder rule, PasarGuard/exit setting and unit created by gretun."
+    confirm "Uninstall gretun?" N || return 0
+    NO_RB=1 ASSUME_YES=1
+    local f n
+    for f in "$PG_DIR"/*.conf; do ARGS=("$(basename "$f" .conf)"); cmd_pg_remove || true; done
+    for f in "$EXIT_DIR"/*.conf; do remove_file "$f"; done
+    fwd_load
+    if (( ${#F_LISTEN[@]} )) || [[ -f "$UDP_CFG" ]]; then cmd_fwd_uninstall || true; fi
+    for n in $(tun_list); do
+        ufw_gre delete "$(conf_val "$TUN_DIR/$n.conf" REMOTE)"
+        if (( ! TEST_MODE )); then run systemctl disable "gretun@$n.service" >/dev/null 2>&1 || true; fi
+        remove_file "$TUN_DIR/$n.conf"
+    done
+    remove_file "$GLOBAL_CONF"
+    sync_all || true
+    [[ -f "$SYSCTL_TUNE" ]] && ARGS=(revert) && cmd_tune
+    if (( ! TEST_MODE )); then
+        run systemctl stop gretun-rollback.timer >/dev/null 2>&1 || true
+        remove_file "$SYSTEMD_DIR/gretun@.service"
+        daemon_reload
+    fi
+    remove_file "$SYSCTL_FWD"
+    rm -rf "$RB_PENDING" "$RUNDIR"
+    if (( PURGE )); then
+        run rm -rf "$ETC" "$STATE"
+        (( TEST_MODE )) || remove_file "$INSTALL_PATH"
+        ok "gretun removed completely."
+    else
+        ok "gretun removed. Backups and legacy files stay in $ETC (use --purge to delete them and the program)."
+    fi
+    info "Runtime sysctl values (forwarding) stay until the next reboot."
+}
+
+# hidden: re-run by systemd, udev, the rollback timer
+cmd_tunnel_up() {
+    HEAL_MODE=1
+    take_lock
+    tunnel_ensure "$1" || exit 1
+    fw_sync || true
+    routes_sync
+}
+cmd_tunnel_down() { tunnel_delete_iface "$1"; }
+cmd_heal() {
+    HEAL_MODE=1
+    take_lock nonblock
+    (( DRY )) || mkdir -p "$RUNDIR"
+    sync_all quiet || true
+    (( DRY )) || watchdog
+    fwd_heal || true
+}
+
+# ======================================================================
+# Menus
+# ======================================================================
+run_action() {  # each action in a subshell: an error returns to the menu
+    ( take_lock; self_install; "$@" ) || true
+    pause
+}
+banner() {
+    local n st line=""
+    clear 2>/dev/null || true
+    printf '%sgretun %s%s  - GRE tunnels, IPv6 forwarder, PasarGuard WireGuard exit\n' "$BOLD" "$VERSION" "$NC"
+    printf 'Server: %s   IPv4 %s   IPv6 %s\n' "$(hostname)" "$(detect_local 4 || true)" "$(detect_local 6 || true)"
+    for n in $(tun_list); do
+        if iface_exists "$n"; then st="${GREEN}up${NC}"; else st="${RED}down${NC}"; fi
+        line+="$n($(conf_val "$TUN_DIR/$n.conf" ROLE),$st) "
+    done
+    printf 'Tunnels: %s\n' "${line:-none}"
+    if rb_pending; then printf '%sWaiting for confirmation: %s  ->  Tools > Confirm%s\n' "$YELLOW" "$(cat "$RB_PENDING/label")" "$NC"; fi
+}
+menu_tunnel() {
+    local c n
+    while :; do
+        choose c "1) GRE tunnel" \
+            "Foreign (exit) server: create a tunnel and print the connection key" \
+            "Iran (entry) server: paste a connection key" \
+            "Manual setup (either server)" \
+            "List tunnels and status (ping, traffic)" \
+            "Show the connection key of a tunnel" \
+            "Remove a tunnel" \
+            "Import an existing tunnel (gre1 manual / haproxy-forwarder)" \
+            "Alerts (ntfy) when a tunnel goes down"
+        case "$c" in
+            0) return 0 ;;
+            1) O_ROLE=foreign; run_action cmd_tunnel_add; O_ROLE="" ;;
+            2) ask n "Paste the connection key"; O_KEY="$n"; run_action cmd_tunnel_add; O_KEY="" ;;
+            3) run_action cmd_tunnel_add ;;
+            4) run_action tunnel_status ;;
+            5) ARGS=(); run_action cmd_tunnel_key ;;
+            6) ARGS=(); run_action cmd_tunnel_remove ;;
+            7) ARGS=(); run_action cmd_import ;;
+            8) local a
+               choose a "Alerts" "Set the ntfy URL" "Send a test alert" "Turn alerts off"
+               case "$a" in 1) ARGS=(set) ;; 2) ARGS=(test) ;; 3) ARGS=(off) ;; *) continue ;; esac
+               run_action cmd_alert ;;
+        esac
+    done
+}
+menu_fwd() {
+    local c
+    while :; do
+        choose c "2) IPv6 port forwarder (Iran IPv4 port -> foreign IPv6, no tunnel)" \
+            "Add ports" "List rules" "Remove ports" "Status (services, connections, traffic)" \
+            "Live monitor" "Rebuild configs from the rules file" "Uninstall the forwarder"
+        ARGS=()
+        case "$c" in
+            0) return 0 ;; 1) run_action cmd_fwd_add ;; 2) run_action cmd_fwd_list ;; 3) run_action cmd_fwd_remove ;;
+            4) run_action cmd_fwd_status ;; 5) ( cmd_fwd_monitor ) || true ;; 6) run_action cmd_fwd_rebuild ;;
+            7) run_action cmd_fwd_uninstall ;;
+        esac
+    done
+}
+menu_pg() {
+    local c
+    while :; do
+        choose c "3) PasarGuard WireGuard node via GRE" \
+            "Iran server: set up the node (send WG clients out through a tunnel)" \
+            "Foreign server: add the exit (paste the exit key)" \
+            "Check everything (status / verify)" \
+            "Show what to set in the PasarGuard panel" \
+            "Show the exit key again (Iran)" \
+            "Iran: undo the node setup" \
+            "Foreign: remove an exit"
+        ARGS=()
+        case "$c" in
+            0) return 0 ;; 1) run_action cmd_pg_setup ;; 2) run_action cmd_exit_add ;; 3) run_action cmd_pg_status ;;
+            4) run_action cmd_pg_panel ;; 5) run_action cmd_pg_key ;; 6) run_action cmd_pg_remove ;; 7) run_action cmd_exit_remove ;;
+        esac
+    done
+}
+menu_tools() {
+    local c
+    while :; do
+        choose c "Tools" \
+            "Speed test over a tunnel (iperf3 client)" "Speed test server (run on the other side first)" \
+            "Tuning: apply BBR + fq, buffers, conntrack" "Tuning: revert" \
+            "Confirm the pending change" "Roll back the pending change now" \
+            "Repair now (heal)" "Install / update gretun in /usr/local/sbin" "Uninstall gretun"
+        ARGS=()
+        case "$c" in
+            0) return 0 ;;
+            1) run_action cmd_bench ;;
+            2) BENCH_SERVER=1; ( cmd_bench ) || true; BENCH_SERVER=0 ;;
+            3) ARGS=(apply); run_action cmd_tune ;; 4) ARGS=(revert); run_action cmd_tune ;;
+            5) run_action rb_confirm ;; 6) run_action rb_fire ;;
+            7) ( cmd_heal ) || true; ok "Done."; pause ;;
+            8) run_action true ;; 9) run_action cmd_uninstall ;;
+        esac
+    done
+}
+menu_main() {
+    (( HAVE_TTY )) || die "No terminal for the menu. Use the CLI: gretun help"
+    local c
+    while :; do
+        banner
+        choose c "Main menu" "GRE tunnel" "IPv6 port forwarder" "PasarGuard WireGuard node via GRE" \
+            "Status of everything" "Doctor (find problems, with hints)" "Tools (speed test, tuning, confirm/rollback, uninstall)"
+        case "$c" in
+            0) exit 0 ;; 1) menu_tunnel ;; 2) menu_fwd ;; 3) menu_pg ;;
+            4) run_action cmd_status ;; 5) run_action cmd_doctor ;; 6) menu_tools ;;
+        esac
+    done
+}
+
+# ======================================================================
+# CLI
+# ======================================================================
+usage() {
+    cat <<EOF
+gretun $VERSION - GRE tunnels, IPv6 port forwarder, PasarGuard WireGuard exit
+
+Usage: gretun                         interactive menu
+       gretun COMMAND [options]
+
+1) GRE tunnel
+  tunnel add --role foreign --peer IRAN_IP [--family 4|6] [--local IP] [--mtu N] [--name gre1]
+                                     foreign server: create, print the connection key
+  tunnel add --key KEY               Iran server: connect with the key (pings the peer)
+  tunnel add --role iran --peer FOREIGN_IP --inner-net 10.X.Y.0/30 [--family] [--mtu]
+  tunnel list | status [NAME]        state, ping/RTT/loss (v4+v6), traffic
+  tunnel key NAME [--raw]            print the connection key again (foreign side)
+  tunnel remove NAME [--force]
+  tunnel import manual [--if gre1] [--role iran|foreign] [--inner-peer IP]
+  tunnel import legacy               take over HAProxy.sh / HAProxy-GRE6.sh
+
+2) IPv6 port forwarder
+  fwd add --dest IPV6 --ports 443,8443|4040=443 [--proto tcp|udp|both] [--proxy] [--check]
+  fwd list | remove PORT... | status | monitor [--interval 2] | rebuild | uninstall [--purge]
+
+3) PasarGuard WireGuard node via GRE
+  pg setup [--node NAME|--node-dir /opt/NAME] [--tunnel gre1] --v4 10.0.0.0/16 [--v6 fd10:10::/64]
+           [--table N] [--wg-if wg0]          Iran server; prints an exit key
+  pg status | verify | panel | key | remove [NODE]
+  exit add --key EXIT_KEY  |  exit add --tunnel gre1 --v4 CIDR [--v6 CIDR] [--wan eth0]
+  exit list | remove TUNNEL                   foreign server
+
+Tools
+  status | doctor | heal
+  bench [--tunnel gre1] [--time 10]   |  bench --server
+  tune apply | revert | show
+  alert set URL [--token T] | test | off
+  confirm | rollback                 keep / undo the pending routing change
+  install | uninstall [--purge] | version
+
+Global options
+  -y, --yes            answer yes / use defaults (non-interactive)
+  --dry-run            print what would change, change nothing
+  --confirm            keep a routing change right away if its checks pass
+  --rollback-secs N    safety timer for routing changes (default 180-600)
+  --replace-haproxy-cfg  allow replacing an unrelated haproxy.cfg (a backup is kept)
+  --no-color
+
+Logs: journalctl -t gretun
+EOF
+}
+parse_args() {
+    while (( $# )); do
+        case "$1" in
+            -y|--yes) ASSUME_YES=1 ;;
+            --dry-run) DRY=1 ;;
+            --confirm) AUTO_CONFIRM=1 ;;
+            --no-color) NO_COLOR=1; set_colors ;;
+            --force) FORCE=1 ;;
+            --purge) PURGE=1 ;;
+            --raw) RAW=1 ;;
+            --proxy) O_PROXY=1 ;;
+            --check) O_CHECK=1 ;;
+            --server) BENCH_SERVER=1 ;;
+            --replace-haproxy-cfg) REPLACE_HAPROXY=1 ;;
+            --fire) ;;
+            --rollback-secs|--role|--family|--peer|--local|--mtu|--name|--key|--if|--dest|--ports|--proto|\
+            --interval|--node|--node-dir|--tunnel|--v4|--v6|--table|--wg-if|--wan|--url|--token|--time|\
+            --inner-peer|--inner-net)
+                (( $# >= 2 )) || die "$1 needs a value."
+                case "$1" in
+                    --rollback-secs) [[ "$2" =~ ^[0-9]+$ ]] && (( $2 >= 30 || (TEST_MODE && $2 >= 3) )) || die "--rollback-secs must be >= 30"; RB_SECS="$2" ;;
+                    --role) O_ROLE="$2" ;; --family) O_FAMILY="$2" ;; --peer) O_PEER="$2" ;; --local) O_LOCAL="$2" ;;
+                    --mtu) O_MTU="$2" ;; --name) O_NAME="$2" ;; --key) O_KEY="$2" ;; --if) O_IF="$2" ;;
+                    --dest) O_DEST="$2" ;; --ports) O_PORTS="$2" ;; --proto) O_PROTO="$2" ;; --interval) O_INTERVAL="$2" ;;
+                    --node) O_NODE="$2" ;; --node-dir) O_NODE_DIR="$2" ;; --tunnel) O_TUNNEL="$2" ;;
+                    --v4) O_V4="$2" ;; --v6) O_V6="$2" ;; --table) O_TABLE="$2" ;; --wg-if) O_WG_IF="$2" ;;
+                    --wan) O_WAN="$2" ;; --url) O_URL="$2" ;; --token) O_TOKEN="$2" ;; --time) O_TIME="$2" ;;
+                    --inner-peer) O_INNER_PEER="$2" ;; --inner-net) O_INNER_NET="$2" ;;
+                esac
+                shift ;;
+            -h|--help) ARGS+=(help) ;;
+            -*) die "Unknown option: $1 (see: gretun help)" ;;
+            *) ARGS+=("$1") ;;
+        esac
+        shift
+    done
+}
+preflight() {
+    [[ "$(id -u)" == 0 ]] || die "Run as root (sudo -i)."
+    if (( ! TEST_MODE )); then
+        have systemctl || die "systemd is required."
+        local id=""
+        id="$(os_field ID) $(os_field ID_LIKE)"
+        [[ "$id" == *debian* || "$id" == *ubuntu* ]] || warn "Only Debian/Ubuntu are supported; continuing anyway."
+    fi
+}
+main() {
+    parse_args "$@"
+    set -- "${ARGS[@]}"
+    local cmd="${1:-menu}" sub="${2:-}"
+    case "$cmd" in
+        help) usage; return 0 ;;
+        version|--version) printf 'gretun %s\n' "$VERSION"; return 0 ;;
+    esac
+    preflight
+    # hidden helpers called by systemd/udev/timers
+    case "$cmd" in
+        tunnel-up) cmd_tunnel_up "${sub:?}"; return ;;
+        tunnel-down) cmd_tunnel_down "${sub:?}"; return ;;
+        offload-apply) offload_apply "${sub:?}"; return ;;
+        heal) cmd_heal; return ;;
+        pg-restart) shift; pg_restart "$@" || true; sync_all quiet || true; return ;;
+        rollback) take_lock; rb_fire; return ;;
+        confirm) take_lock; rb_confirm; return ;;
+    esac
+    if [[ "$cmd" == menu ]]; then menu_main; return; fi
+    shift
+    if (( $# )); then shift; fi
+    ARGS=("$@")
+    take_lock
+    case "$cmd" in
+        tunnel|tunnels|t)
+            case "$sub" in
+                add) self_install; cmd_tunnel_add ;; list|status|"") tunnel_status "${ARGS[0]:-}" ;;
+                key) cmd_tunnel_key ;; remove|rm|del) cmd_tunnel_remove ;;
+                import) self_install; cmd_import ;;
+                *) die "Unknown: gretun tunnel $sub (see: gretun help)" ;;
+            esac ;;
+        fwd|forward|forwarder|f)
+            case "$sub" in
+                add) self_install; cmd_fwd_add ;; list|"") cmd_fwd_list ;; remove|rm|del) cmd_fwd_remove ;;
+                status) cmd_fwd_status ;; monitor) exec 9>&-; cmd_fwd_monitor ;; rebuild) cmd_fwd_rebuild ;;
+                uninstall) cmd_fwd_uninstall ;;
+                *) die "Unknown: gretun fwd $sub" ;;
+            esac ;;
+        pg|pasarguard)
+            case "$sub" in
+                setup|add) self_install; cmd_pg_setup ;; status|verify|"") cmd_pg_status ;; panel) cmd_pg_panel ;;
+                key) cmd_pg_key ;; remove|rm|del) cmd_pg_remove ;;
+                *) die "Unknown: gretun pg $sub" ;;
+            esac ;;
+        exit)
+            case "$sub" in
+                add) self_install; cmd_exit_add ;; list|"") cmd_exit_list ;; status|verify) cmd_pg_status ;;
+                remove|rm|del) cmd_exit_remove ;;
+                *) die "Unknown: gretun exit $sub" ;;
+            esac ;;
+        status) ARGS=("$sub" "${ARGS[@]}"); cmd_status ;;
+        doctor) cmd_doctor ;;
+        bench) [[ -n "$sub" ]] && O_TUNNEL="${O_TUNNEL:-$sub}"; exec 9>&-; cmd_bench ;;
+        tune) ARGS=("$sub" "${ARGS[@]}"); cmd_tune ;;
+        alert|alerts) ARGS=("$sub" "${ARGS[@]}"); cmd_alert ;;
+        sync) sync_all ;;
+        install) self_install; ok "gretun $VERSION is installed in $INSTALL_PATH." ;;
+        uninstall) cmd_uninstall ;;
+        *) die "Unknown command: $cmd (see: gretun help)" ;;
+    esac
+}
+
+main "$@"
