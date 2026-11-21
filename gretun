@@ -26,7 +26,7 @@
 set -Eeuo pipefail
 shopt -s nullglob
 
-readonly VERSION="1.2.2"
+readonly VERSION="1.2.3"
 readonly MARK="# Managed by gretun"
 
 # GRETUN_ROOT prefixes every path and switches off systemd/udev calls. It is
@@ -2733,9 +2733,11 @@ ask_wan() {  # ask_wan VAR 4|6
     done
 }
 alloc_table() {
-    local t used
-    used=$( { ip -4 rule show; ip -6 rule show; } 2>/dev/null | awk '{for (i = 1; i < NF; i++) if ($i == "lookup") print $(i + 1)}'
-        cat "$PG_DIR"/*.conf 2>/dev/null | awk -F= '$1 == "TABLE" {print $2}')
+    local t used f
+    used=$( { ip -4 rule show; ip -6 rule show; } 2>/dev/null | awk '{for (i = 1; i < NF; i++) if ($i == "lookup") print $(i + 1)}')
+    # A for loop, not "cat dir/*.conf": with nullglob and no files, cat would
+    # read the terminal and wait forever.
+    for f in "$PG_DIR"/*.conf; do used+=$'\n'"$(conf_val "$f" TABLE)"; done
     for (( t = 1470; t < 1500; t++ )); do
         grep -qx "$t" <<<"$used" && continue
         [[ -z "$(ip -4 route show table "$t" 2>/dev/null)$(ip -6 route show table "$t" 2>/dev/null)" ]] || continue

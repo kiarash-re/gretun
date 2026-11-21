@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.2.3 — 2026-11-21
+
+- Fix: PasarGuard setup hung after the subnet questions on a server without any
+  PasarGuard setup yet. Choosing the routing table ran `cat` on an empty file list,
+  which then waited for keyboard input. Nothing had been changed at that point.
+- Tests: commands now run with an open stdin, so a command that wrongly reads it
+  fails the test instead of passing.
+
 ## 1.2.2 — 2026-11-21
 
 - Fix: after a tunnel was created on the foreign server, the key screen stopped with

@@ -53,16 +53,19 @@ check() {  # check "description" command...
 section() { printf '\n\033[1m== %s ==\033[0m\n' "$*"; }
 nsx() { local n="$1"; shift; ip netns exec "gt-$n" "$@"; }
 # gretun inside a "server": gt NS ARGS...
+# stdin is a pipe that stays open (not /dev/null): a command that wrongly reads
+# stdin then hangs and is caught by the timeout, as it would hang over SSH.
 gt() {
     local n="$1"
     shift
     ip netns exec "gt-$n" env GRETUN_ROOT="$T/$n" GRETUN_SELF="$G" NO_COLOR=1 \
-        timeout 240 "$G" "$@" </dev/null
+        timeout 240 "$G" "$@" < <(exec sleep 6001)
 }
 cleanup() {
     local p
     for p in "$T"/*/run/gretun/*.pid; do kill "$(cat "$p")" 2>/dev/null; done
     pkill -f "gretun-test" 2>/dev/null
+    pkill -x -f "sleep 6001" 2>/dev/null
     for p in "${NS[@]}"; do
         ip netns pids "$p" 2>/dev/null | xargs -r kill 2>/dev/null
         ip netns del "$p" 2>/dev/null
@@ -244,6 +247,7 @@ EOF
 chmod +x "$T/iran/usr/local/bin/pgnode"
 
 start=$(date +%s)
+# First node on this server: no pg/*.conf yet (1.2.2 hung here reading stdin).
 gt iran -y --confirm pg setup --node pgnode --tunnel gre1 --v4 10.0.0.0/16 --v6 fd10:10::/64 >"$T/pg.log" 2>&1
 check "pg setup did not hang on '<name> restart' (< 120 s)" test $(( $(date +%s) - start )) -lt 120
 ENV="$T/iran/opt/pgnode/.env"
