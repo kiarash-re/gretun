@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.2.1 — 2026-11-21
+
+- Fix: the menu rejected every answer ("Type a number from the list"), and address,
+  subnet, destination and WAN prompts never accepted a value (also with CLI flags such
+  as `--peer`/`--local`). A local variable in the prompt helper had the same name as the
+  caller's variable. Tested through a real terminal.
+- Main menu shows "0) Exit" instead of "0) Back".
+
 ## 1.2.0 — 2026-11-21
 
 - New `gretun update`: downloads the latest version from GitHub, or takes a copied

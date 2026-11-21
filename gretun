@@ -26,7 +26,7 @@
 set -Eeuo pipefail
 shopt -s nullglob
 
-readonly VERSION="1.2.0"
+readonly VERSION="1.2.1"
 readonly MARK="# Managed by gretun"
 
 # GRETUN_ROOT prefixes every path and switches off systemd/udev calls. It is
@@ -163,17 +163,19 @@ remove_file() {
 }
 
 # ---------------------------------------------------------------- prompts
+# The locals use a prefix no caller uses: "printf -v VAR" would otherwise
+# set ask's own local instead of the caller's variable of the same name.
 ask() {  # ask VAR "Prompt" [default]
-    local __a="" __d="${3:-}"
+    local __ask_in="" __ask_def="${3:-}"
     if (( ASSUME_YES || ! HAVE_TTY )); then
-        [[ -n "$__d" ]] || die "Missing value for: $2 (pass it as a CLI flag, see: gretun help)"
-        printf -v "$1" '%s' "$__d"
+        [[ -n "$__ask_def" ]] || die "Missing value for: $2 (pass it as a CLI flag, see: gretun help)"
+        printf -v "$1" '%s' "$__ask_def"
         return 0
     fi
-    read -r -p "$2${__d:+ [$__d]}: " __a </dev/tty || true
-    __a="${__a#"${__a%%[![:space:]]*}"}"
-    __a="${__a%"${__a##*[![:space:]]}"}"
-    printf -v "$1" '%s' "${__a:-$__d}"
+    read -r -p "$2${__ask_def:+ [$__ask_def]}: " __ask_in </dev/tty || true
+    __ask_in="${__ask_in#"${__ask_in%%[![:space:]]*}"}"
+    __ask_in="${__ask_in%"${__ask_in##*[![:space:]]}"}"
+    printf -v "$1" '%s' "${__ask_in:-$__ask_def}"
 }
 confirm() {  # confirm "Question" [Y|N]
     local d="${2:-N}" a=""
@@ -193,21 +195,22 @@ pause() {
     fi
 }
 choose() {  # choose VAR "Title" option... -> VAR=1..N (0 = back)
-    local __var="$1" __title="$2" __i=1 __a
+    local __ch_var="$1" __ch_title="$2" __ch_n=1 __ch_item __ch_ans="" __ch_zero=Back
     shift 2
-    printf '\n%s%s%s\n' "$BOLD" "$__title" "$NC"
-    for __a in "$@"; do
-        printf '  %s%2d)%s %s\n' "$GREEN" "$__i" "$NC" "$__a"
-        __i=$((__i + 1))
+    if [[ "$__ch_title" == "Main menu" ]]; then __ch_zero=Exit; fi
+    printf '\n%s%s%s\n' "$BOLD" "$__ch_title" "$NC"
+    for __ch_item in "$@"; do
+        printf '  %s%2d)%s %s\n' "$GREEN" "$__ch_n" "$NC" "$__ch_item"
+        __ch_n=$((__ch_n + 1))
     done
-    printf '  %s 0)%s Back\n' "$GREEN" "$NC"
+    printf '  %s 0)%s %s\n' "$GREEN" "$NC" "$__ch_zero"
     while :; do
-        ask __a "Choose" "0"
-        if [[ "$__a" =~ ^[0-9]+$ ]] && (( 10#$__a < __i )); then
-            printf -v "$__var" '%s' "$((10#$__a))"
+        ask __ch_ans "Choose" "0"
+        if [[ "$__ch_ans" =~ ^[0-9]{1,3}$ ]] && (( 10#$__ch_ans < __ch_n )); then
+            printf -v "$__ch_var" '%s' "$((10#$__ch_ans))"
             return 0
         fi
-        warn "Type a number from the list."
+        warn "Type a number from 0 to $((__ch_n - 1))."
     done
 }
 
