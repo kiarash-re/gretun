@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.2.5 — 2026-11-21
+
+- Fix: at "Keep this change?" pressing Enter alone undid the change immediately.
+  Now an explicit answer is needed: `yes` keeps, `no` undoes, `later` returns and leaves
+  the safety timer running (confirm with `gretun confirm`). Anything else asks again,
+  with the remaining time shown. If the terminal goes away (SSH dropped), the timer
+  decides instead of an immediate undo.
+
 ## 1.2.4 — 2026-11-21
 
 - Fix (important for nodes installed without docker): after `<name> restart`, gretun

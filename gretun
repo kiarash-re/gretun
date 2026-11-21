@@ -26,7 +26,7 @@
 set -Eeuo pipefail
 shopt -s nullglob
 
-readonly VERSION="1.2.4"
+readonly VERSION="1.2.5"
 readonly MARK="# Managed by gretun"
 
 # GRETUN_ROOT prefixes every path and switches off systemd/udev calls. It is
@@ -577,14 +577,37 @@ rb_arm() {  # rb_arm DEFAULT_SECONDS: starts the timer, then asks to confirm
         return 0
     fi
     if (( HAVE_TTY && ! ASSUME_YES )); then
-        printf 'Check that everything works (SSH, clients, the other server), then type %syes%s to keep it.\n' "$BOLD" "$NC"
-        read -r -t "$secs" -p "Keep this change? " a </dev/tty || true
-        if [[ "$a" == [yY]* ]]; then
-            rb_confirm
-        else
-            warn "Not confirmed. Rolling back now..."
-            rb_fire
-        fi
+        # An explicit answer is required: Enter alone must never undo the change.
+        local end left
+        end=$(( $(date +%s) + secs ))
+        printf 'Check that everything works (SSH, clients, the other server).\n'
+        printf '  %syes%s   = keep it\n  %sno%s    = undo it now\n  %slater%s = decide later (run %sgretun confirm%s or %sgretun rollback%s before the timer ends)\n' \
+            "$BOLD" "$NC" "$BOLD" "$NC" "$BOLD" "$NC" "$BOLD" "$NC" "$BOLD" "$NC"
+        while :; do
+            left=$(( end - $(date +%s) ))
+            if (( left <= 0 )); then a=""; break; fi
+            a=""
+            local rc=0
+            read -r -t "$left" -p "Keep this change? [yes/no/later] (${left}s left): " a </dev/tty || rc=$?
+            if (( rc > 128 )); then break; fi   # timed out
+            if (( rc != 0 )); then
+                # End of input (Ctrl+D or the SSH connection dropped): the timer decides.
+                printf '\n'
+                info "No answer. The safety timer undoes the change in $(( end - $(date +%s) ))s unless you run: gretun confirm"
+                return 0
+            fi
+            case "${a,,}" in
+                y|yes) rb_confirm; return 0 ;;
+                n|no) warn "Undoing the change now..."; rb_fire; return 0 ;;
+                l|later)
+                    info "The safety timer keeps running. Confirm with: gretun confirm"
+                    return 0 ;;
+                *) warn "Type yes, no or later." ;;
+            esac
+        done
+        printf '\n'
+        warn "No answer before the timer ended. Undoing the change..."
+        rb_fire
     else
         printf 'Run %sgretun confirm%s within %ss to keep it, or %sgretun rollback%s to undo now.\n' \
             "$BOLD" "$NC" "$secs" "$BOLD" "$NC"
