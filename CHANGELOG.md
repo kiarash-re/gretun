@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.2.0 — 2026-11-21
+
+- New `gretun update`: downloads the latest version from GitHub, or takes a copied
+  file with `--file PATH` (for Iran servers). Checks that the file is a complete gretun
+  script, shows both versions, refuses silent downgrades, replaces the program
+  atomically and re-applies the configuration. Also in the menu (Tools).
+- An older copy of the script no longer overwrites a newer installed version when it runs.
+
 ## 1.1.0 — 2026-11-21
 
 - Menu: "advanced settings" step in PasarGuard setup (routing table, WireGuard interface)

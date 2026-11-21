@@ -26,7 +26,7 @@
 set -Eeuo pipefail
 shopt -s nullglob
 
-readonly VERSION="1.1.0"
+readonly VERSION="1.2.0"
 readonly MARK="# Managed by gretun"
 
 # GRETUN_ROOT prefixes every path and switches off systemd/udev calls. It is
@@ -85,7 +85,7 @@ REPLACE_HAPROXY=0 BENCH_SERVER=0
 O_ROLE="" O_FAMILY="" O_PEER="" O_LOCAL="" O_MTU="" O_NAME="" O_KEY="" O_IF=""
 O_DEST="" O_PORTS="" O_PROTO="" O_PROXY=0 O_CHECK=0 O_INTERVAL=2
 O_NODE="" O_NODE_DIR="" O_TUNNEL="" O_V4="" O_V6="" O_TABLE="" O_WG_IF="" O_WAN=""
-O_URL="" O_TOKEN="" O_TIME=10 O_INNER_PEER="" O_INNER_NET=""
+O_URL="" O_TOKEN="" O_TIME=10 O_INNER_PEER="" O_INNER_NET="" O_FILE=""
 ARGS=()
 HEAL_MODE=0
 HAVE_TTY=0
@@ -3359,9 +3359,76 @@ self_install() {
     src=$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || true)
     [[ -f "$src" && "$src" != "$INSTALL_PATH" ]] || return 0
     if [[ ! -f "$INSTALL_PATH" ]] || ! cmp -s "$src" "$INSTALL_PATH"; then
+        local inst
+        inst=$(file_version "$INSTALL_PATH")
+        if [[ -n "$inst" ]] && ver_lt "$VERSION" "$inst"; then
+            info "Not replacing $INSTALL_PATH: it is newer ($inst) than this copy ($VERSION)."
+            return 0
+        fi
         install -m 755 "$src" "$INSTALL_PATH"
         info "Installed as $INSTALL_PATH (run 'gretun' from now on)."
     fi
+}
+file_version() { sed -n 's/^readonly VERSION="\([0-9][0-9.]*\)"$/\1/p' "$1" 2>/dev/null | head -n1; }
+ver_lt() { [[ "$1" != "$2" && "$(printf '%s\n%s\n' "$1" "$2" | sort -V | head -n1)" == "$1" ]]; }
+UPDATE_URL="${GRETUN_UPDATE_URL:-https://raw.githubusercontent.com/kiarash-re/gretun/main/gretun}"
+# gretun update [--file PATH]: download (or take a local file), check it, replace.
+cmd_update() {
+    local tmp newv inst_v="$VERSION"
+    tmp=$(mktemp)
+    if [[ -n "$O_FILE" ]]; then
+        [[ -f "$O_FILE" ]] || { rm -f "$tmp"; die "File not found: $O_FILE"; }
+        cp "$O_FILE" "$tmp"
+    else
+        need curl:curl
+        info "Downloading the latest version from GitHub..."
+        if ! curl -fsSL --connect-timeout 10 --max-time 60 -o "$tmp" "$UPDATE_URL"; then
+            rm -f "$tmp"
+            err "Could not download from GitHub (common on Iran servers)."
+            hint "On a computer or server that can reach GitHub:"
+            hint "  curl -fsSL -o gretun $UPDATE_URL"
+            hint "  scp gretun root@THIS_SERVER:/root/gretun"
+            hint "Then here:  gretun update --file /root/gretun"
+            return 1
+        fi
+    fi
+    newv=$(file_version "$tmp")
+    # A complete file starts with the bash shebang, ends with the call to main
+    # and parses; this catches truncated downloads and HTML error pages.
+    if [[ -z "$newv" ]] || ! head -n1 "$tmp" | grep -q '^#!.*bash' \
+        || [[ "$(tail -n1 "$tmp")" != 'main "$@"' ]] || ! bash -n "$tmp" 2>/dev/null; then
+        rm -f "$tmp"
+        die "The new file is not a valid gretun script (incomplete download?). Nothing was changed."
+    fi
+    if [[ -f "$INSTALL_PATH" ]]; then inst_v=$(file_version "$INSTALL_PATH"); fi
+    if [[ -f "$INSTALL_PATH" ]] && cmp -s "$tmp" "$INSTALL_PATH"; then
+        rm -f "$tmp"
+        ok "Already up to date (gretun $newv)."
+        return 0
+    fi
+    printf '  installed: %s\n  new:       %s\n' "${inst_v:-none}" "$newv"
+    if [[ -n "$inst_v" ]] && ver_lt "$newv" "$inst_v"; then
+        warn "The new file is an OLDER version."
+        if (( ASSUME_YES && ! FORCE )); then rm -f "$tmp"; die "Not downgrading without --force."; fi
+        confirm "Downgrade to $newv?" N || { rm -f "$tmp"; return 0; }
+    else
+        confirm "Update to $newv?" Y || { rm -f "$tmp"; return 0; }
+    fi
+    if (( DRY || TEST_MODE )); then
+        printf '%s[dry-run]%s install %s -> %s\n' "$DIM" "$NC" "$newv" "$INSTALL_PATH"
+        rm -f "$tmp"
+        return 0
+    fi
+    install -m 755 "$tmp" "$INSTALL_PATH.new"
+    mv -f "$INSTALL_PATH.new" "$INSTALL_PATH"
+    rm -f "$tmp"
+    jlog "updated $inst_v -> $newv"
+    ok "gretun updated to $newv. Your tunnels and settings in $ETC are unchanged."
+    # The new version re-applies its units and rules (same as the heal timer does).
+    info "Re-applying the configuration with the new version..."
+    exec 9>&-
+    "$INSTALL_PATH" sync </dev/null || warn "Re-applying reported problems; run: gretun doctor"
+    if [[ -n "${GRETUN_IN_MENU:-}" ]]; then warn "Exit and start gretun again to use the new menu."; fi
 }
 cmd_uninstall() {
     warn "This removes every tunnel, forwarder rule, PasarGuard/exit setting and unit created by gretun."
@@ -3501,7 +3568,8 @@ menu_tools() {
             "Speed test over a tunnel (iperf3 client)" "Speed test server (run on the other side first)" \
             "Tuning: apply BBR + fq, buffers, conntrack" "Tuning: revert" \
             "Confirm the pending change" "Roll back the pending change now" \
-            "Repair now (heal)" "Install / update gretun in /usr/local/sbin" "Uninstall gretun"
+            "Repair now (heal)" "Update gretun (download the latest version from GitHub)" \
+            "Update gretun from a local file (copied with scp)" "Uninstall gretun"
         ARGS=()
         case "$c" in
             0) return 0 ;;
@@ -3510,7 +3578,9 @@ menu_tools() {
             3) ARGS=(apply); run_action cmd_tune ;; 4) ARGS=(revert); run_action cmd_tune ;;
             5) run_action rb_confirm ;; 6) run_action rb_fire ;;
             7) ( cmd_heal ) || true; ok "Done."; pause ;;
-            8) run_action true ;; 9) run_action cmd_uninstall ;;
+            8) O_FILE=""; GRETUN_IN_MENU=1 run_action cmd_update ;;
+            9) ask O_FILE "Path of the new gretun file" /root/gretun; GRETUN_IN_MENU=1 run_action cmd_update; O_FILE="" ;;
+            10) run_action cmd_uninstall ;;
         esac
     done
 }
@@ -3566,6 +3636,7 @@ Tools
   tune apply | revert | show
   alert set URL [--token T] | test | off
   confirm | rollback                 keep / undo the pending routing change
+  update [--file /root/gretun]       download the latest version (or use a copied file)
   install | uninstall [--purge] | version
 
 Global options
@@ -3596,7 +3667,7 @@ parse_args() {
             --fire) ;;
             --rollback-secs|--role|--family|--peer|--local|--mtu|--name|--key|--if|--dest|--ports|--proto|\
             --interval|--node|--node-dir|--tunnel|--v4|--v6|--table|--wg-if|--wan|--url|--token|--time|\
-            --inner-peer|--inner-net)
+            --inner-peer|--inner-net|--file)
                 (( $# >= 2 )) || die "$1 needs a value."
                 case "$1" in
                     --rollback-secs) [[ "$2" =~ ^[0-9]+$ ]] && (( $2 >= 30 || (TEST_MODE && $2 >= 3) )) || die "--rollback-secs must be >= 30"; RB_SECS="$2" ;;
@@ -3606,7 +3677,7 @@ parse_args() {
                     --node) O_NODE="$2" ;; --node-dir) O_NODE_DIR="$2" ;; --tunnel) O_TUNNEL="$2" ;;
                     --v4) O_V4="$2" ;; --v6) O_V6="$2" ;; --table) O_TABLE="$2" ;; --wg-if) O_WG_IF="$2" ;;
                     --wan) O_WAN="$2" ;; --url) O_URL="$2" ;; --token) O_TOKEN="$2" ;; --time) O_TIME="$2" ;;
-                    --inner-peer) O_INNER_PEER="$2" ;; --inner-net) O_INNER_NET="$2" ;;
+                    --inner-peer) O_INNER_PEER="$2" ;; --inner-net) O_INNER_NET="$2" ;; --file) O_FILE="$2" ;;
                 esac
                 shift ;;
             -h|--help) ARGS+=(help) ;;
@@ -3683,6 +3754,7 @@ main() {
         alert|alerts) ARGS=("$sub" "${ARGS[@]}"); cmd_alert ;;
         sync) sync_all ;;
         install) self_install; ok "gretun $VERSION is installed in $INSTALL_PATH." ;;
+        update|upgrade) cmd_update ;;
         uninstall) cmd_uninstall ;;
         *) die "Unknown command: $cmd (see: gretun help)" ;;
     esac

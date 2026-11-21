@@ -44,6 +44,24 @@ bash /root/gretun install
 
 If `apt` is blocked as well, install the packages from a local mirror first. Sections 1 and 3 need `iproute2 nftables ethtool iputils-ping kmod`. Section 2 also needs `haproxy`, plus `nginx libnginx-mod-stream` for UDP. `gretun bench` needs `iperf3`, and alerts need `curl`.
 
+### Update
+
+On servers that can reach GitHub:
+
+```bash
+gretun update
+```
+
+It downloads the latest version and shows the installed and new version numbers. Before replacing anything it checks that the file is complete and parses. Then it re-applies your configuration. Tunnels, rules and PasarGuard settings in `/etc/gretun` stay as they are. It refuses to install an older version unless you confirm (or pass `--force` together with `-y`).
+
+On Iran servers, download the file somewhere else and copy it over with `scp` as in the offline install. Then:
+
+```bash
+gretun update --file /root/gretun
+```
+
+Both are also in the menu: **Tools → Update gretun**.
+
 ### Taking over a server from the old scripts
 
 If a server was set up with **HAProxy-GRE6.sh** or **HAProxy.sh** (haproxy-forwarder), gretun refuses to run next to it and offers to import it:
@@ -380,6 +398,32 @@ bash /root/gretun install
 - بخش ۲: به‌علاوه‌ی `haproxy`، و برای UDP هم `nginx libnginx-mod-stream`
 - تست سرعت: `iperf3`
 - هشدارها: `curl`
+
+### به‌روزرسانی
+
+روی سرورهایی که GitHub باز است:
+
+</div>
+
+```bash
+gretun update
+```
+
+<div dir="rtl">
+
+نسخه‌ی جدید دانلود می‌شود و شماره‌ی نسخه‌ی فعلی و جدید نشان داده می‌شود. قبل از جایگزینی بررسی می‌شود که فایل کامل و سالم باشد. بعد تنظیمات دوباره اعمال می‌شوند. تونل‌ها، قانون‌ها و تنظیمات پاسارگارد در `/etc/gretun` دست نمی‌خورند. نسخه‌ی قدیمی‌تر فقط با تأیید شما (یا `--force` همراه `-y`) نصب می‌شود.
+
+روی سرور ایران، فایل را جای دیگری دانلود کنید و مثل نصب آفلاین با `scp` بفرستید. بعد:
+
+</div>
+
+```bash
+gretun update --file /root/gretun
+```
+
+<div dir="rtl">
+
+هر دو در منو هم هستند: **Tools ← Update gretun**
 
 ### انتقال از اسکریپت‌های قبلی
 
