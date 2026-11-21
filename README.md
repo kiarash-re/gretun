@@ -18,11 +18,8 @@ Requirements: Debian/Ubuntu, systemd, root.
 
 ### Online (servers that can reach GitHub)
 
-The repository is private, so the download needs a GitHub token with read access to it
-(a fine-grained token with "Contents: read" for this repository only is enough):
-
 ```bash
-curl -fsSL -H "Authorization: Bearer YOUR_GITHUB_TOKEN" -o /usr/local/sbin/gretun https://raw.githubusercontent.com/kiarash-re/gretun/main/gretun && chmod +x /usr/local/sbin/gretun
+curl -fsSL -o /usr/local/sbin/gretun https://raw.githubusercontent.com/kiarash-re/gretun/main/gretun && chmod +x /usr/local/sbin/gretun
 ```
 
 ```bash
@@ -329,12 +326,10 @@ sudo bash tests/netns-test.sh --install-deps
 
 ### نصب آنلاین
 
-مخزن خصوصی است، پس برای دانلود یک توکن GitHub لازم است. یک توکن fine-grained که فقط به همین مخزن دسترسی «Contents: read» داشته باشد کافی است. `YOUR_GITHUB_TOKEN` را با آن عوض کنید:
-
 </div>
 
 ```bash
-curl -fsSL -H "Authorization: Bearer YOUR_GITHUB_TOKEN" -o /usr/local/sbin/gretun https://raw.githubusercontent.com/kiarash-re/gretun/main/gretun && chmod +x /usr/local/sbin/gretun
+curl -fsSL -o /usr/local/sbin/gretun https://raw.githubusercontent.com/kiarash-re/gretun/main/gretun && chmod +x /usr/local/sbin/gretun
 ```
 
 <div dir="rtl">
