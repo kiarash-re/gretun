@@ -1,5 +1,15 @@
 # Changelog
 
+## 1.2.4 — 2026-11-21
+
+- Fix (important for nodes installed without docker): after `<name> restart`, gretun
+  stopped the whole process group, which could also stop a node that the command had
+  started in the background. Now only the log follower and the command itself are stopped.
+- Node restart order: systemd unit (`systemctl restart <name>`) first, then
+  `docker compose up -d --force-recreate`, then `<name> restart`.
+- The restart log moved from /run (RAM) to /var/log/gretun/, and a progress line is
+  printed every 15 s while waiting. Verification also reads `journalctl -u <unit>`.
+
 ## 1.2.3 — 2026-11-21
 
 - Fix: PasarGuard setup hung after the subnet questions on a server without any

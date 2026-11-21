@@ -66,6 +66,7 @@ cleanup() {
     for p in "$T"/*/run/gretun/*.pid; do kill "$(cat "$p")" 2>/dev/null; done
     pkill -f "gretun-test" 2>/dev/null
     pkill -x -f "sleep 6001" 2>/dev/null
+    pkill -x -f "sleep 6002" 2>/dev/null
     for p in "${NS[@]}"; do
         ip netns pids "$p" 2>/dev/null | xargs -r kill 2>/dev/null
         ip netns del "$p" 2>/dev/null
@@ -241,6 +242,10 @@ ip route replace default dev "\$out" table "\$tbl"
 iptables -t nat -C POSTROUTING -s 10.0.0.0/16 -o "\$nat" -j MASQUERADE 2>/dev/null \
   || iptables -t nat -A POSTROUTING -s 10.0.0.0/16 -o "\$nat" -j MASQUERADE
 ethtool -K wg0 gso on gro on tso on 2>/dev/null
+# Like a node installed without docker: the node process is started in the
+# background, in the same process group as this command.
+pkill -x -f "sleep 6002" 2>/dev/null
+sleep 6002 &
 echo "policy routing iif wg0 -> table \$tbl default dev \$out"
 exec sleep 600
 EOF
@@ -250,6 +255,8 @@ start=$(date +%s)
 # First node on this server: no pg/*.conf yet (1.2.2 hung here reading stdin).
 gt iran -y --confirm pg setup --node pgnode --tunnel gre1 --v4 10.0.0.0/16 --v6 fd10:10::/64 >"$T/pg.log" 2>&1
 check "pg setup did not hang on '<name> restart' (< 120 s)" test $(( $(date +%s) - start )) -lt 120
+check "the node started by '<name> restart' is still running" pgrep -x -f "sleep 6002"
+check "the log follower of '<name> restart' was stopped" bash -c "! pgrep -x -f 'sleep 600'"
 ENV="$T/iran/opt/pgnode/.env"
 for kv in PG_NODE_WG_HOST_ROUTING=1 PG_NODE_WG_NAT_OUTPUT_INTERFACE=gre1 PG_NODE_WG_NAT_EGRESS_ONLY=0 \
     PG_NODE_WG_NAT_DISABLE=0 PG_NODE_WG_ROUTE_OUT_INTERFACE=gre1; do

@@ -26,7 +26,7 @@
 set -Eeuo pipefail
 shopt -s nullglob
 
-readonly VERSION="1.2.3"
+readonly VERSION="1.2.4"
 readonly MARK="# Managed by gretun"
 
 # GRETUN_ROOT prefixes every path and switches off systemd/udev calls. It is
@@ -2640,21 +2640,44 @@ wait_iface() {  # wait_iface NAME SECONDS
 # Restarts a node so it re-reads .env. "<name> restart" follows the logs
 # forever, so it runs in its own process group and is stopped once the node
 # has logged its routing line (or after 90 s).
+LOG_DIR="$R/var/log/gretun"
+pg_log() { printf '%s/pg-%s.log' "$LOG_DIR" "$1"; }
+pg_unit() {  # prints the systemd unit of a node that runs without docker
+    (( TEST_MODE )) && return 1
+    local u
+    for u in "$1.service" "$1-node.service"; do
+        if [[ -n "$(systemctl list-unit-files --no-legend "$u" 2>/dev/null)" ]]; then printf '%s' "$u"; return 0; fi
+    done
+    return 1
+}
+# Stops what "<name> restart" left following the logs, and the command itself,
+# but never the node: a node started in the background stays in the same
+# process group, so the whole group must not be killed.
+stop_log_followers() {  # stop_log_followers SESSION_PID
+    local p cmd
+    for p in $(pgrep -s "$1" 2>/dev/null); do
+        [[ "$p" == "$1" ]] && continue
+        cmd=$(tr '\0' ' ' <"/proc/$p/cmdline" 2>/dev/null) || continue
+        case "$cmd" in
+            journalctl*|*/journalctl*|tail\ *|*/tail\ *|*" logs "*|*" logs") kill -TERM "$p" 2>/dev/null || true ;;
+        esac
+    done
+    kill -TERM "$1" 2>/dev/null || true
+}
+# Restarts a node so it re-reads .env, in this order:
+#   1. systemd unit (node installed without docker): systemctl restart
+#   2. docker compose: up -d --force-recreate (a plain restart keeps the old env)
+#   3. "<name> restart", which follows the logs forever: stopped once the node
+#      logged its routing line or after 90 s, without touching the node.
 pg_restart() {  # pg_restart DIR NAME CLI CONTAINER WG_IF
-    local dir="$1" name="$2" cli="$3" cont="$4" wg="${5:-wg0}" log="$RUNDIR/pg-$2.log" pid i cf
+    local dir="$1" name="$2" cli="$3" cont="$4" wg="${5:-wg0}" log pid i cf unit
     (( DRY )) && { printf '%s[dry-run]%s restart PasarGuard node %s\n' "$DIM" "$NC" "$name"; return 0; }
-    mkdir -p "$RUNDIR"
+    log=$(pg_log "$name")
+    mkdir -p "$LOG_DIR"
     : >"$log"
-    if [[ -n "$cli" && -x "$cli" ]]; then
-        info "Restarting the node with '$name restart' (stopped automatically, log: $log)..."
-        setsid "$cli" restart </dev/null >"$log" 2>&1 &
-        pid=$!
-        for (( i = 0; i < 90; i++ )); do
-            sleep 1
-            kill -0 "$pid" 2>/dev/null || break
-            if grep -q 'policy routing' "$log" && iface_exists "$wg"; then sleep 2; break; fi
-        done
-        kill -TERM -- "-$pid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null || true
+    if unit=$(pg_unit "$name"); then
+        info "Restarting the node: systemctl restart $unit ..."
+        timeout 120 systemctl restart "$unit" || warn "systemctl restart $unit failed; see: journalctl -u $unit"
     elif cf=$(compose_file "$dir") && have docker; then
         info "Recreating the node container (docker compose up -d --force-recreate)..."
         if docker compose version >/dev/null 2>&1; then
@@ -2662,16 +2685,31 @@ pg_restart() {  # pg_restart DIR NAME CLI CONTAINER WG_IF
         else
             (cd "$dir" && timeout 180 docker-compose -f "$cf" up -d --force-recreate) >"$log" 2>&1 || warn "docker-compose failed; see $log"
         fi
+    elif [[ -n "$cli" && -x "$cli" ]]; then
+        info "Restarting the node with '$name restart' (stopped automatically within 90 s)..."
+        setsid "$cli" restart </dev/null >"$log" 2>&1 &
+        pid=$!
+        for (( i = 1; i <= 90; i++ )); do
+            sleep 1
+            kill -0 "$pid" 2>/dev/null || break
+            if grep -q 'policy routing' "$log" && iface_exists "$wg"; then sleep 2; break; fi
+            if (( i % 15 == 0 )); then info "  still waiting for the node ($i s)..."; fi
+        done
+        stop_log_followers "$pid"
     else
-        warn "Cannot restart node $name automatically (no '$name' command and no docker compose). Restart it yourself."
+        warn "Cannot restart node $name automatically (no systemd unit, docker compose or '$name' command). Restart it yourself."
         return 1
     fi
-    wait_iface "$wg" 30 || true
-    if [[ -n "$cont" ]] && have docker; then docker logs --tail 300 "$cont" >>"$log" 2>&1 || true; fi
+    if ! iface_exists "$wg"; then
+        info "Waiting up to 30 s for $wg..."
+        wait_iface "$wg" 30 || true
+    fi
     return 0
 }
 pg_node_log() {  # pg_node_log NODE CONTAINER
-    cat "$RUNDIR/pg-$1.log" 2>/dev/null || true
+    local unit
+    cat "$(pg_log "$1")" 2>/dev/null || true
+    if unit=$(pg_unit "$1"); then journalctl -u "$unit" --since "-10min" --no-pager 2>/dev/null || true; fi
     if [[ -n "$2" ]] && have docker; then docker logs --tail 500 "$2" 2>&1 || true; fi
 }
 
