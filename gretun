@@ -26,7 +26,7 @@
 set -Eeuo pipefail
 shopt -s nullglob
 
-readonly VERSION="1.2.5"
+readonly VERSION="1.2.6"
 readonly MARK="# Managed by gretun"
 
 # GRETUN_ROOT prefixes every path and switches off systemd/udev calls. It is
@@ -1118,6 +1118,9 @@ $nrules    }
         fi
     done
     local last="$RUNDIR/nft.applied"
+    # "$(cat last)" drops the final newline; without this the rules never
+    # compared equal and heal re-applied them every minute.
+    text="${text%$'\n'}"
     if (( ${#tuns[@]} == 0 && ${#nat4[@]} == 0 && ${#nat6[@]} == 0 )); then
         local tb
         for tb in "inet $NFT_T" "ip ${NFT_T}_nat" "ip6 ${NFT_T}_nat"; do

@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.2.6 — 2026-11-21
+
+- Fix: the heal timer replaced gretun's nft tables every minute although nothing had
+  changed (the saved copy lost its final newline, so it never compared equal). Rules
+  are now applied only when they change, and the journal no longer fills with
+  "run: nft -f -" every minute.
+
 ## 1.2.5 — 2026-11-21
 
 - Fix: at "Keep this change?" pressing Enter alone undid the change immediately.
