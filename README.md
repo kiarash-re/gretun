@@ -114,6 +114,7 @@ gretun
 | | Uninstall | Removes rules and services (restores the original `haproxy.cfg`) |
 | **3) PasarGuard WG via GRE** | Iran: set up node | Edits `.env`, restarts the node, adds IPv6 policy routing, prints an exit key |
 | | Foreign: add exit | Paste the exit key: forwarding, NAT, return routes |
+| | *Advanced settings* | Both steps offer them (default: no): routing table and WireGuard interface on Iran, WAN interface(s) on the foreign server |
 | | Check everything | All checks, on either server |
 | | Panel settings | What you still have to set in the panel |
 | | Show exit key | Prints the exit key again |
@@ -183,6 +184,23 @@ gretun exit add --key 'gretun-exit://...'
 ```bash
 gretun pg status
 ```
+
+Advanced settings (the menu offers the same, the defaults are automatic):
+
+| Flag | Meaning | Default |
+|---|---|---|
+| `--table N` | Routing table (`PG_NODE_WG_ROUTE_TABLE`) | First free table in 1470–1499 |
+| `--wg-if NAME` | WireGuard interface of the node | `wg0` |
+| `--node NAME` / `--node-dir DIR` | Which node | Detected |
+| `--tunnel NAME` | Which tunnel | The only Iran-side tunnel |
+| `--wan IFACE` | WAN interface on the foreign server (`exit add`) | Interface of the default route |
+| `--rollback-secs N` | Time to confirm before the automatic rollback | 600 |
+
+```bash
+gretun pg setup --node pg-node --tunnel gre1 --v4 10.0.0.0/16 --v6 fd10:10::/64 --table 200 --wg-if wg0
+```
+
+A table or interface chosen once is kept in `/etc/gretun/pg/<node>.conf` for later runs.
 
 Tools:
 
@@ -423,6 +441,7 @@ gretun tunnel import manual --if gre1 --role iran
 - **۳) پاسارگارد WireGuard**
   - ایران: راه‌اندازی نود
   - خارج: افزودن exit با کلید
+  - هر دو مرحله «تنظیمات پیشرفته» را هم پیشنهاد می‌دهند (پیش‌فرض: نه). در ایران شماره‌ی جدول routing و اینترفیس WireGuard، و در خارج اینترفیس WAN. در CLI همین‌ها با `--table`، `--wg-if` و `--wan` تعیین می‌شوند.
   - بررسی همه‌چیز
   - تنظیمات لازم در پنل
   - نمایش دوباره‌ی کلید exit

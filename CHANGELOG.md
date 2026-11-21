@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.1.0 — 2026-11-21
+
+- Menu: "advanced settings" step in PasarGuard setup (routing table, WireGuard interface)
+  and in exit setup (IPv4/IPv6 WAN interface). Off by default; the automatic values stay.
+  A chosen table that is already in use triggers a warning and a question.
+- CLI: table numbers are validated the same way (1–251 or 256 and up).
+- README: table of the Section 3 advanced flags.
+
 ## 1.0.0 — 2026-11-21
 
 First release.

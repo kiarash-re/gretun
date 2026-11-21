@@ -26,7 +26,7 @@
 set -Eeuo pipefail
 shopt -s nullglob
 
-readonly VERSION="1.0.0"
+readonly VERSION="1.1.0"
 readonly MARK="# Managed by gretun"
 
 # GRETUN_ROOT prefixes every path and switches off systemd/udev calls. It is
@@ -2707,6 +2707,26 @@ ask_subnets() {  # ask_subnets VAR 4|6 FLAGVALUE "prompt" DEFAULT [optional]
         warn "Enter IPv$2 networks such as $( [[ $2 == 4 ]] && echo 10.0.0.0/16 || echo fd10:10::/64 )."
     done
 }
+valid_table() { [[ "$1" =~ ^[0-9]{1,9}$ ]] && (( 10#$1 > 0 && 10#$1 < 252 || 10#$1 > 255 )); }
+table_free() {  # no routes in it and no ip rule points to it
+    [[ -z "$(ip -4 route show table "$1" 2>/dev/null)$(ip -6 route show table "$1" 2>/dev/null)" ]] || return 1
+    ! { ip -4 rule show; ip -6 rule show; } 2>/dev/null | grep -qE "lookup $1( |\$)"
+}
+# want_advanced "current values": interactive only; asks whether to change them
+want_advanced() {
+    (( HAVE_TTY && ! ASSUME_YES )) || return 1
+    printf '\nAdvanced settings: %s\n' "$1"
+    confirm "Change the advanced settings? (the automatic values are fine for almost everyone)" N
+}
+ask_wan() {  # ask_wan VAR 4|6
+    local __a __d
+    __d=$(wan_if "$2")
+    while :; do
+        ask __a "IPv$2 WAN interface ('auto' follows the default route${__d:+, now $__d})" auto
+        if [[ "$__a" == auto ]] || iface_exists "$__a"; then printf -v "$1" '%s' "$__a"; return 0; fi
+        warn "Interface $__a does not exist. Interfaces: $(ip -o link show | awk -F': ' '{print $2}' | cut -d@ -f1 | paste -sd' ' -)"
+    done
+}
 alloc_table() {
     local t used
     used=$( { ip -4 rule show; ip -6 rule show; } 2>/dev/null | awk '{for (i = 1; i < NF; i++) if ($i == "lookup") print $(i + 1)}'
@@ -2771,7 +2791,26 @@ cmd_pg_setup() {
     wg="${O_WG_IF:-$(conf_val "${old:-/dev/null}" WG_IF wg0)}"
     tbl="${O_TABLE:-$(conf_val "${old:-/dev/null}" TABLE)}"
     [[ -n "$tbl" ]] || tbl=$(alloc_table)
-    [[ "$tbl" =~ ^[0-9]+$ ]] && (( tbl > 0 && tbl < 252 || tbl > 255 )) || die "Invalid table number: $tbl"
+    valid_table "$tbl" || die "Invalid table number: $tbl (use 1-251 or 256 and up)"
+    if [[ -z "$O_TABLE" && -z "$O_WG_IF" ]] && want_advanced "routing table $tbl, WireGuard interface $wg"; then
+        local a
+        while :; do
+            ask a "Routing table number (PG_NODE_WG_ROUTE_TABLE)" "$tbl"
+            if ! valid_table "$a"; then warn "Use a number 1-251 or 256 and up."; continue; fi
+            if [[ "$a" != "$(conf_val "${old:-/dev/null}" TABLE)" ]] && ! table_free "$a"; then
+                warn "Table $a is already used on this server (routes or ip rules point to it)."
+                confirm "Use it anyway?" N || continue
+            fi
+            tbl="$a"
+            break
+        done
+        while :; do
+            ask a "WireGuard interface of the node" "$wg"
+            if [[ "$a" =~ ^[a-zA-Z0-9_.-]{1,15}$ ]]; then wg="$a"; break; fi
+            warn "Not a valid interface name."
+        done
+        iface_exists "$wg" || warn "$wg does not exist right now (fine if the node creates it later)."
+    fi
     pref=$(alloc_pref "$name")
 
     section "PasarGuard node $name via $tun"
@@ -2975,6 +3014,10 @@ cmd_exit_add() {
     tun_load "$tun" || die "Unknown tunnel $tun."
     [[ "${C[ROLE]}" == foreign ]] || die "Tunnel $tun is an Iran-side tunnel."
     local wan4="${O_WAN:-auto}" wan6="${O_WAN:-auto}"
+    if [[ -z "$O_WAN" ]] && want_advanced "WAN interface: auto (IPv4 $(wan_if 4), IPv6 $(wan_if 6))"; then
+        ask_wan wan4 4
+        ask_wan wan6 6
+    fi
     section "Exit through $tun"
     cat <<EOF
   WAN interface:  IPv4 $( [[ $wan4 == auto ]] && wan_if 4 || echo "$wan4" )   IPv6 $( [[ $wan6 == auto ]] && wan_if 6 || echo "$wan6" )
