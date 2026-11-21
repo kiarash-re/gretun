@@ -142,6 +142,9 @@ gt foreign -y tunnel add --role foreign --family 6 --peer 2001:db8:1::2 --local 
 check "foreign: ip6gre tunnel gre1 created" nsx foreign ip link show gre1
 KEY=$(gt foreign tunnel key gre1 --raw)
 check "foreign: connection key printed" grep -q '^gretun://' <<<"$KEY"
+out=$(gt foreign tunnel key gre1)
+check "key screen shows the ready Iran command" grep -qF "gretun tunnel add --key '$KEY'" <<<"$out"
+check "key screen shows the manual values" grep -q 'Tunnel network:' <<<"$out"
 gt iran -y tunnel add --key "$KEY" >"$T/iran-add.log" 2>&1
 check "iran: tunnel from key" nsx iran ip link show gre1
 P4=$(grep '^IN4_PEER=' "$T/iran/etc/gretun/tunnels/gre1.conf" | cut -d= -f2)

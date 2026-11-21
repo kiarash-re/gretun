@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.2.2 — 2026-11-21
+
+- Fix: after a tunnel was created on the foreign server, the key screen stopped with
+  "C[FAMILY]: unbound variable" (the tunnel itself was created correctly).
+- The key screen now also prints the complete line to paste on the Iran server:
+  `gretun tunnel add --key '...'`.
+
 ## 1.2.1 — 2026-11-21
 
 - Fix: the menu rejected every answer ("Type a number from the list"), and address,

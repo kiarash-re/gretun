@@ -26,7 +26,7 @@
 set -Eeuo pipefail
 shopt -s nullglob
 
-readonly VERSION="1.2.1"
+readonly VERSION="1.2.2"
 readonly MARK="# Managed by gretun"
 
 # GRETUN_ROOT prefixes every path and switches off systemd/udev calls. It is
@@ -1422,12 +1422,14 @@ print_key() {  # print_key NAME
     local key
     key=$(key_for "$1") || die "Unknown tunnel $1."
     if (( RAW )); then printf '%s\n' "$key"; return 0; fi
+    # key_for ran in a subshell: load the tunnel here for the details below.
+    tun_load "$1" || die "Unknown tunnel $1."
     section "Connection key for the Iran server"
+    printf 'Key (menu on the Iran server: 1) GRE tunnel -> 2) paste a connection key):\n\n'
     printf '%s%s%s\n\n' "$GREEN$BOLD" "$key" "$NC"
+    printf 'Or paste this whole line on the Iran server:\n\n'
+    printf "%sgretun tunnel add --key '%s'%s\n\n" "$GREEN$BOLD" "$key" "$NC"
     cat <<EOF
-On the Iran server run:   gretun tunnel add --key '$key'
-(or in the menu: 1) GRE tunnel -> 2) Iran server: paste a connection key)
-
 Manual values instead of the key:
   Transport:       IPv${C[FAMILY]}
   Iran address:    ${C[REMOTE]}
