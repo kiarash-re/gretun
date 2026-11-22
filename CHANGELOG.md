@@ -1,5 +1,16 @@
 # Changelog
 
+## 1.6.1 — 2026-11-22
+
+- Fix: an exit whose return route was set up by hand before (same subnet through the same
+  tunnel, e.g. after importing a manual gre1) was refused by the new overlap check, and heal
+  warned every minute that the route could not be added. Such a route is now taken over;
+  routes of the server itself are still refused.
+- Fix: live traffic showed a huge false spike when an interface came up while the view was open.
+  The cursor is also restored however the view ends.
+- Fix: client subnets of a single address (/32, /128) made heal delete and re-add their route
+  and rule every minute.
+
 ## 1.6.0 — 2026-11-22
 
 - New: traffic tracker. Usage per tunnel and per PasarGuard WireGuard interface (today, this

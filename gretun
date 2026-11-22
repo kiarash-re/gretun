@@ -26,7 +26,7 @@
 set -Eeuo pipefail
 shopt -s nullglob
 
-readonly VERSION="1.6.0"
+readonly VERSION="1.6.1"
 readonly MARK="# Managed by gretun"
 
 # GRETUN_ROOT prefixes every path and switches off systemd/udev calls. It is
@@ -1350,6 +1350,8 @@ routes_current() {
             { type = "unicast"; i = 1
               if ($1 ~ /^(unreachable|blackhole|prohibit|throw)$/) { type = $1; i = 2 }
               dst = $i; via = ""; dev = ""; tbl = "main"
+              # ip prints a single address without /32 or /128; gretun keeps the prefix.
+              if (dst != "default" && dst !~ /\//) dst = dst (F == 6 ? "/128" : "/32")
               for (j = i + 1; j <= NF; j++) {
                   if ($j == "via") via = $(j + 1)
                   if ($j == "dev") dev = $(j + 1)
@@ -1373,7 +1375,16 @@ route_cmd() {  # route_cmd add|del "FAM|TYPE|DST|TABLE|VIA|DEV"
     if [[ -n "$dev" ]]; then a+=(dev "$dev"); fi
     if [[ "$type" == unreachable ]]; then a+=(metric "$UNREACH_METRIC"); fi
     a+=(proto "$RT_PROTO")
-    run "${a[@]}" 2>/dev/null || { [[ "$1" == del ]] || warn "Could not add route: ${a[*]}"; }
+    if run "${a[@]}" 2>/dev/null; then return 0; fi
+    [[ "$1" == del ]] && return 0
+    # A route left by an old manual setup through the same tunnel is taken over;
+    # any other route with this prefix belongs to the server and stays.
+    if [[ "$tbl" == main && -n "$dev" ]] \
+        && ip "-$fam" route show table main exact "$dst" 2>/dev/null | grep -qE " dev $dev( |\$)"; then
+        a[3]=replace
+        run "${a[@]}" 2>/dev/null && return 0
+    fi
+    warn "Could not add route: ${a[*]}"
 }
 # Desired ip -6 rules as "PREF|FROM|IIF|TABLE".
 rules_desired() {
@@ -1396,6 +1407,7 @@ rules_current() {
               if ($i == "from") from = $(i + 1)
               if ($i == "iif") iif = $(i + 1)
               if ($i == "lookup" || $i == "table") tbl = $(i + 1) }
+          if (from != "all" && from !~ /\//) from = from "/128"
           print p "|" from "|" iif "|" tbl }'
 }
 routes_sync() {
@@ -3787,7 +3799,7 @@ exit_subnets_free() {
                 bad=1
             fi
         done < <( { ip "-$fam" -o addr show 2>/dev/null | awk '{print $4}'
-                    ip "-$fam" route show table main 2>/dev/null | awk '$0 !~ / proto 147( |$)/ {
+                    ip "-$fam" route show table main 2>/dev/null | awk -v t="$1" '$0 !~ / proto 147( |$)/ && $0 !~ (" dev " t "( |$)") {
                         d = $1; if (d ~ /^(unicast|local|broadcast|blackhole|unreachable|prohibit|throw)$/) d = $2
                         if (d != "default" && d !~ /^(fe80|ff)/) print d }'; } | sort -u)
     done
@@ -3968,9 +3980,12 @@ cmd_traffic_live() {
     for i in "${ifs[@]}"; do iface_exists "$i" || continue; n=1; done
     (( ${n:-0} )) || die "No tunnel or WireGuard interface is up."
     exec 9>&-
-    if [[ -t 1 ]]; then printf '\033[?25l'; fi
-    trap 'printf "\033[?25h\n"; exit 0' INT TERM
-    for i in "${ifs[@]}"; do read -r "prx[$i]" "ptx[$i]" < <(iface_bytes "$i"); hist[$i]=""; pk[$i]=0; sesrx[$i]=0; sestx[$i]=0; done
+    if [[ -t 1 ]]; then printf '\033[?25l'; trap 'printf "\033[?25h"' EXIT; fi
+    trap 'printf "\n"; exit 0' INT TERM
+    for i in "${ifs[@]}"; do
+        hist[$i]="" pk[$i]=0 sesrx[$i]=0 sestx[$i]=0 prx[$i]="" ptx[$i]=""
+        if iface_exists "$i"; then read -r "prx[$i]" "ptx[$i]" < <(iface_bytes "$i"); fi
+    done
     prev_t=$(date +%s.%N)
     while :; do
         sleep "$iv"
@@ -3986,11 +4001,13 @@ cmd_traffic_live() {
             local rx tx
             if ! iface_exists "$i"; then
                 printf '%s%s%s  %s%s%s\n\n' "$BOLD" "$i" "$NC" "$RED" "down" "$NC"
+                prx[$i]="" ptx[$i]=""
                 continue
             fi
             read -r rx tx < <(iface_bytes "$i")
-            (( rx >= ${prx[$i]:-0} )) || prx[$i]=$rx
-            (( tx >= ${ptx[$i]:-0} )) || ptx[$i]=$tx
+            # Just came up, or its counters restarted: start from here (no false spike).
+            if [[ -z "${prx[$i]}" ]] || (( rx < prx[$i] )); then prx[$i]=$rx; fi
+            if [[ -z "${ptx[$i]}" ]] || (( tx < ptx[$i] )); then ptx[$i]=$tx; fi
             rin=$(( rx - prx[$i] )) rout=$(( tx - ptx[$i] ))
             sesrx[$i]=$(( sesrx[$i] + rin )) sestx[$i]=$(( sestx[$i] + rout ))
             prx[$i]=$rx ptx[$i]=$tx
