@@ -1,5 +1,14 @@
 # Changelog
 
+## 1.3.1 — 2026-11-22
+
+- Menu 1) GRE tunnel: new item "Iran server: forward ports through a tunnel to the foreign
+  server". It asks only for the tunnel (if there are several) and the ports. CLI:
+  `gretun tunnel forward [NAME] --ports 6000`.
+- Menu 2) is now "Port forwarding": the tunnel destinations are listed first, a foreign IPv6
+  without a tunnel last. It was named "IPv6 port forwarder ... no tunnel", which hid that it
+  can use a tunnel.
+
 ## 1.3.0 — 2026-11-21
 
 - Fix: PasarGuard setup assumed the WireGuard interface was `wg0`. With a panel core named

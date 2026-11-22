@@ -125,7 +125,8 @@ gretun
 | | Import | Hand-made `gre1`, or haproxy-forwarder |
 | | Alerts | ntfy URL for tunnel down/up messages |
 | | Edit | MTU, either server's address, tunnel network, role; prints the matching command for the other server |
-| **2) IPv6 forwarder** | Add ports | Destination IPv6 (or a tunnel's inner IP), ports, TCP/UDP, PROXY v2, health check |
+| | Forward ports through a tunnel | Iran server: a port here goes through the tunnel to the foreign server (same as 2) with the tunnel as destination) |
+| **2) Port forwarding** | Add ports | Destination: the foreign server through a tunnel, or a foreign IPv6 directly; ports, TCP/UDP, PROXY v2, health check |
 | | List / Remove | Shows or removes rules |
 | | Status | Services, listening ports, connections, traffic, whether the destination is reachable |
 | | Live monitor | Per-port rates every N seconds |
@@ -174,6 +175,9 @@ gretun tunnel remove gre2
 ```
 ```bash
 gretun tunnel edit gre1 --mtu 1420
+```
+```bash
+gretun tunnel forward gre1 --ports 6000 --proto tcp
 ```
 
 `tunnel edit` without options opens an editor for MTU, this server's and the other server's
@@ -496,8 +500,9 @@ gretun tunnel import manual --if gre1 --role iran
   - حذف تونل
   - import
   - هشدار ntfy
+  - سرور ایران: فوروارد پورت از داخل تونل به سرور خارج (فقط تونل و پورت را می‌پرسد)
   - ویرایش تونل: MTU، آدرس هر دو سرور، شبکه‌ی داخل تونل، نقش سرور. دستور هم‌سانِ سرور مقابل را هم نشان می‌دهد.
-- **۲) فوروارد IPv6**
+- **۲) فوروارد پورت** (از داخل تونل به سرور خارج، یا مستقیم به IPv6 خارج)
   - افزودن پورت
   - لیست و حذف
   - وضعیت (سرویس‌ها، اتصال‌ها، ترافیک)

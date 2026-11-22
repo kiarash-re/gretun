@@ -26,7 +26,7 @@
 set -Eeuo pipefail
 shopt -s nullglob
 
-readonly VERSION="1.3.0"
+readonly VERSION="1.3.1"
 readonly MARK="# Managed by gretun"
 
 # GRETUN_ROOT prefixes every path and switches off systemd/udev calls. It is
@@ -1655,6 +1655,31 @@ cmd_tunnel_key() {
     print_key "$n"
 }
 
+# tunnel forward: Iran port(s) -> the foreign server through a tunnel
+# (the forwarder of section 2 with the tunnel's foreign inner IP as destination).
+cmd_tunnel_forward() {
+    local n="${ARGS[0]:-$O_TUNNEL}" f
+    local -a l=()
+    for f in $(tun_list); do [[ "$(conf_val "$TUN_DIR/$f.conf" ROLE)" == iran ]] && l+=("$f"); done
+    (( ${#l[@]} )) || die "Port forwarding is set up on the Iran server, and this server has no Iran-side tunnel."
+    if [[ -z "$n" ]]; then
+        O_TUNNEL=""
+        pick_tunnel n iran
+    fi
+    [[ "$(conf_val "$TUN_DIR/$n.conf" ROLE)" == iran ]] || die "Tunnel $n is not an Iran-side tunnel."
+    O_DEST=$(conf_val "$TUN_DIR/$n.conf" IN4_PEER)
+    printf '
+Ports of this server are forwarded through %s to the foreign server (%s).
+' "$n" "$O_DEST"
+    cmd_fwd_add
+    printf '
+On the foreign server the service must listen on that port (0.0.0.0 or %s).
+' "$O_DEST"
+    printf 'If ufw is active there:  ufw allow in on <its tunnel, e.g. gre1>
+'
+    printf 'Check here with:         gretun fwd status
+'
+}
 addr_arg() {  # addr_arg FAMILY VALUE FLAG: prints the checked address
     if [[ "$1" == 4 ]] && is_ipv4 "$2"; then printf '%s' "$2"; return 0; fi
     if [[ "$1" == 6 ]] && is_ipv6 "$2"; then compress6 "$2"; return 0; fi
@@ -2403,12 +2428,12 @@ ask_dest() {  # ask_dest VAR: foreign IPv6 or the inner IP of a gretun tunnel
     else
         for __n in $(tun_list); do
             [[ "$(conf_val "$TUN_DIR/$__n.conf" ROLE)" == iran ]] || continue
-            __list+=("$(conf_val "$TUN_DIR/$__n.conf" IN4_PEER) (foreign end of tunnel $__n)")
+            __list+=("$(conf_val "$TUN_DIR/$__n.conf" IN4_PEER) (the foreign server, through tunnel $__n)")
         done
         if (( ${#__list[@]} )); then
-            choose __c "Destination" "A foreign IPv6 address (no tunnel)" "${__list[@]}"
+            choose __c "Where should the traffic go?" "${__list[@]}" "A foreign IPv6 address directly (no tunnel)"
             (( __c > 0 )) || exit 0
-            if (( __c > 1 )); then __d="${__list[__c - 2]%% *}"; fi
+            if (( __c <= ${#__list[@]} )); then __d="${__list[__c - 1]%% *}"; fi
         fi
         [[ -n "${__d:-}" ]] || ask __d "Foreign server IPv6 address"
     fi
@@ -3915,7 +3940,8 @@ menu_tunnel() {
             "Remove a tunnel" \
             "Import an existing tunnel (gre1 manual / haproxy-forwarder)" \
             "Alerts (ntfy) when a tunnel goes down" \
-            "Edit a tunnel (MTU, server addresses, tunnel network, role)"
+            "Edit a tunnel (MTU, server addresses, tunnel network, role)" \
+            "Iran server: forward ports through a tunnel to the foreign server"
         case "$c" in
             0) return 0 ;;
             1) O_ROLE=foreign; run_action cmd_tunnel_add; O_ROLE="" ;;
@@ -3930,14 +3956,15 @@ menu_tunnel() {
                case "$a" in 1) ARGS=(set) ;; 2) ARGS=(test) ;; 3) ARGS=(off) ;; *) continue ;; esac
                run_action cmd_alert ;;
             9) ARGS=(); run_action cmd_tunnel_edit ;;
+            10) ARGS=(); run_action cmd_tunnel_forward ;;
         esac
     done
 }
 menu_fwd() {
     local c
     while :; do
-        choose c "2) IPv6 port forwarder (Iran IPv4 port -> foreign IPv6, no tunnel)" \
-            "Add ports" "List rules" "Remove ports" "Status (services, connections, traffic)" \
+        choose c "2) Port forwarding (Iran port -> foreign server, through a tunnel or direct IPv6)" \
+            "Add ports (choose the tunnel or a foreign IPv6)" "List rules" "Remove ports" "Status (services, connections, traffic)" \
             "Live monitor" "Rebuild configs from the rules file" "Uninstall the forwarder"
         ARGS=()
         case "$c" in
@@ -3996,7 +4023,7 @@ menu_main() {
     local c
     while :; do
         banner
-        choose c "Main menu" "GRE tunnel" "IPv6 port forwarder" "PasarGuard WireGuard node via GRE" \
+        choose c "Main menu" "GRE tunnel" "Port forwarding (through a tunnel or to a foreign IPv6)" "PasarGuard WireGuard node via GRE" \
             "Status of everything" "Doctor (find problems, with hints)" "Tools (speed test, tuning, confirm/rollback, uninstall)"
         case "$c" in
             0) exit 0 ;; 1) menu_tunnel ;; 2) menu_fwd ;; 3) menu_pg ;;
@@ -4025,11 +4052,13 @@ Usage: gretun                         interactive menu
   tunnel remove NAME [--force]
   tunnel edit [NAME] [--mtu N] [--local IP] [--peer IP] [--inner-net 10.X.Y.0/30] [--role iran|foreign]
                                      change a tunnel (no options: interactive editor)
+  tunnel forward [NAME] --ports 6000[,7000=443] [--proto tcp|udp|both]
+                                     Iran server: forward ports through the tunnel to the foreign server
   tunnel import manual [--if gre1] [--role iran|foreign] [--inner-peer IP]
   tunnel import legacy               take over HAProxy.sh / HAProxy-GRE6.sh
 
-2) IPv6 port forwarder
-  fwd add --dest IPV6 --ports 443,8443|4040=443 [--proto tcp|udp|both] [--proxy] [--check]
+2) Port forwarding (Iran port -> foreign server)
+  fwd add --dest IPV6|TUNNEL_IP --ports 443,8443|4040=443 [--proto tcp|udp|both] [--proxy] [--check]
   fwd list | remove PORT... | status | monitor [--interval 2] | rebuild | uninstall [--purge]
 
 3) PasarGuard WireGuard node via GRE
@@ -4137,6 +4166,7 @@ main() {
             case "$sub" in
                 add) self_install; cmd_tunnel_add ;; list|status|"") tunnel_status "${ARGS[0]:-}" ;;
                 key) cmd_tunnel_key ;; remove|rm|del) cmd_tunnel_remove ;; edit|set) cmd_tunnel_edit ;;
+                forward|fwd) self_install; cmd_tunnel_forward ;;
                 import) self_install; cmd_import ;;
                 *) die "Unknown: gretun tunnel $sub (see: gretun help)" ;;
             esac ;;
