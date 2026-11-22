@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.4.0 — 2026-11-22
+
+- Removed: forwarding a port straight to a foreign IPv6 address without a tunnel (menu and
+  `fwd add --dest IPV6`). Port forwarding now always goes through a GRE tunnel to the foreign
+  server; with one Iran-side tunnel nothing is asked except the ports.
+- Rules that already point to an IPv6 address (e.g. imported from haproxy-forwarder) keep
+  working and can still be listed and removed.
+
 ## 1.3.1 — 2026-11-22
 
 - Menu 1) GRE tunnel: new item "Iran server: forward ports through a tunnel to the foreign

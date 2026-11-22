@@ -5,7 +5,7 @@
 One Bash script for a VPN setup with an **Iran "entry" server** and a **foreign "exit" server**:
 
 1. **GRE tunnel**: IPv4 (`gre`) or IPv6 (`ip6gre`) between the two servers. Every tunnel carries both IPv4 and IPv6 inside.
-2. **IPv6 port forwarder** (no tunnel needed): users connect to the Iran server's IPv4. TCP goes through HAProxy, UDP through a dedicated nginx-stream service, to a foreign IPv6.
+2. **Port forwarding through a tunnel**: users connect to a port on the Iran server and the traffic goes through the GRE tunnel to the foreign server. TCP goes through HAProxy, UDP through a dedicated nginx-stream service.
 3. **PasarGuard WireGuard node via GRE**: WireGuard clients connect to the PasarGuard node on the Iran server, and all their traffic (IPv4 and IPv6) leaves to the internet from the foreign server.
 
 Everything has an interactive menu **and** CLI flags, so you can paste commands over SSH (Termius).
@@ -125,8 +125,8 @@ gretun
 | | Import | Hand-made `gre1`, or haproxy-forwarder |
 | | Alerts | ntfy URL for tunnel down/up messages |
 | | Edit | MTU, either server's address, tunnel network, role; prints the matching command for the other server |
-| | Forward ports through a tunnel | Iran server: a port here goes through the tunnel to the foreign server (same as 2) with the tunnel as destination) |
-| **2) Port forwarding** | Add ports | Destination: the foreign server through a tunnel, or a foreign IPv6 directly; ports, TCP/UDP, PROXY v2, health check |
+| | Forward ports through a tunnel | Iran server: a port here goes through the tunnel to the foreign server (same as menu 2) |
+| **2) Port forwarding through a tunnel** | Add ports | Tunnel (asked only if there are several), ports, TCP/UDP, PROXY v2, health check |
 | | List / Remove | Shows or removes rules |
 | | Status | Services, listening ports, connections, traffic, whether the destination is reachable |
 | | Live monitor | Per-port rates every N seconds |
@@ -187,11 +187,14 @@ on both servers; gretun prints the command for the other side.
 Section 2:
 
 ```bash
-gretun fwd add --dest 2001:db8::10 --ports 443,8443 --proto tcp
+gretun fwd add --ports 443,8443 --proto tcp
 ```
 ```bash
-gretun fwd add --dest 2001:db8::10 --ports 4040=443 --proto both --proxy --check
+gretun fwd add --ports 4040=443 --proto both --proxy --check
 ```
+
+The destination is always the foreign end of an Iran-side tunnel (`--dest 10.X.Y.2` picks one
+when there are several). Forwarding straight to a foreign IPv6 without a tunnel was removed in 1.4.0.
 ```bash
 gretun fwd status
 ```
@@ -332,12 +335,12 @@ Check performance at any time. With offload off on `gre1` and `wg0`, the field t
 gretun doctor
 ```
 
-## Worked example (b): one IPv6 forwarder rule
+## Worked example (b): forward port 6000 through the tunnel
 
-The foreign server has only IPv6 (`2001:db8:5::10`) and runs Xray on 443. Users should connect to the Iran server's IPv4 on port 443.
+The tunnel `gre1` is up and the foreign server runs a service on port 6000. Users should connect to the Iran server on port 6000. On the Iran server:
 
 ```bash
-gretun fwd add --dest 2001:db8:5::10 --ports 443 --proto tcp
+gretun tunnel forward gre1 --ports 6000 --proto tcp
 ```
 
 Check it:
@@ -346,7 +349,7 @@ Check it:
 gretun fwd status
 ```
 
-Users now connect to `IRAN_IPV4:443`. Add `--proxy` if Xray expects PROXY protocol v2 (`acceptProxyProtocol`).
+Users now connect to `IRAN_IP:6000`. On the foreign server the service must listen on `0.0.0.0` (with ufw: `ufw allow in on gre1`). Add `--proxy` if the service expects PROXY protocol v2.
 
 ---
 
@@ -380,7 +383,7 @@ sudo bash tests/netns-test.sh --install-deps
 **gretun** یک اسکریپت Bash است برای سرویس VPN با یک **سرور ایران (ورودی)** و یک **سرور خارج (خروجی)**. سه بخش دارد:
 
 1. **تونل GRE** با IPv4 یا IPv6 بین دو سرور. داخل هر تونل هم IPv4 هست و هم IPv6.
-2. **فوروارد پورت IPv6** بدون تونل. کاربر به IPv4 سرور ایران وصل می‌شود و ترافیک به IPv6 سرور خارج می‌رود: TCP با HAProxy و UDP با یک سرویس جداگانه‌ی nginx-stream.
+2. **فوروارد پورت از داخل تونل**. کاربر به یک پورت سرور ایران وصل می‌شود و ترافیک از داخل تونل GRE به سرور خارج می‌رود: TCP با HAProxy و UDP با یک سرویس جداگانه‌ی nginx-stream.
 3. **نود WireGuard پاسارگارد از طریق GRE**. کلاینت‌های WireGuard به نود پاسارگارد روی سرور ایران وصل می‌شوند و همه‌ی ترافیک‌شان (IPv4 و IPv6) از سرور خارج به اینترنت می‌رود.
 
 همه‌چیز هم منوی تعاملی دارد و هم دستور خط فرمان. پس می‌توانید دستورها را در Termius کپی و paste کنید. محیط لازم: Debian یا Ubuntu با systemd و دسترسی root.
@@ -502,7 +505,7 @@ gretun tunnel import manual --if gre1 --role iran
   - هشدار ntfy
   - سرور ایران: فوروارد پورت از داخل تونل به سرور خارج (فقط تونل و پورت را می‌پرسد)
   - ویرایش تونل: MTU، آدرس هر دو سرور، شبکه‌ی داخل تونل، نقش سرور. دستور هم‌سانِ سرور مقابل را هم نشان می‌دهد.
-- **۲) فوروارد پورت** (از داخل تونل به سرور خارج، یا مستقیم به IPv6 خارج)
+- **۲) فوروارد پورت از داخل تونل** (پورت سرور ایران به سرور خارج)
   - افزودن پورت
   - لیست و حذف
   - وضعیت (سرویس‌ها، اتصال‌ها، ترافیک)
@@ -604,19 +607,19 @@ gretun doctor
 
 <div dir="rtl">
 
-### مثال (ب): یک قانون فوروارد IPv6
+### مثال (ب): فوروارد پورت 6000 از داخل تونل
 
-سرور خارج فقط IPv6 دارد (`2001:db8:5::10`) و Xray روی پورت 443 اجرا می‌شود:
+تونل `gre1` بالا است و روی سرور خارج سرویسی روی پورت 6000 اجرا می‌شود. روی سرور ایران:
 
 </div>
 
 ```bash
-gretun fwd add --dest 2001:db8:5::10 --ports 443 --proto tcp
+gretun tunnel forward gre1 --ports 6000 --proto tcp
 ```
 
 <div dir="rtl">
 
-حالا کاربرها به `IRAN_IPV4:443` وصل می‌شوند. برای دیدن وضعیت دستور `gretun fwd status` را بزنید. اگر Xray پروتکل PROXY را انتظار دارد، `--proxy` را هم اضافه کنید.
+حالا کاربرها به `IRAN_IP:6000` وصل می‌شوند. روی سرور خارج سرویس باید روی `0.0.0.0` گوش بدهد (اگر ufw فعال است: `ufw allow in on gre1`). برای دیدن وضعیت دستور `gretun fwd status` را بزنید.
 
 ### تست
 
