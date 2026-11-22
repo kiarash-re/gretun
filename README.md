@@ -149,9 +149,12 @@ Enter on an empty key or port prompt cancels.
 | | 6 Edit the node setup | WireGuard interface, client subnets, routing table, tunnel (same checks and rollback as setup) |
 | | 7 Undo the node setup | Puts the old `.env` values back |
 | | 8 Edit an exit / 9 Remove an exit | Foreign server: client subnets, WAN interface(s) / NAT and return routes |
-| **4) Status** | | Everything at a glance |
-| **5) Doctor** | | Offloads, MTUs, rules, tables, NAT, pings, units, with plain-English hints |
-| **6) Tools** | | Speed test, tuning, 5 keep / 6 undo the pending change, repair, update, uninstall |
+| **4) Traffic** | 1 Usage | Per tunnel and WireGuard interface: today, this month, total, last 7 days as bars |
+| | 2 Live speed | In/out rate with bars, a sparkline of the last seconds, peak (Ctrl+C stops) |
+| | 3 Live speed per port | The forwarder's per-port monitor |
+| **5) Status** | | Everything at a glance |
+| **6) Doctor** | | Offloads, MTUs, rules, tables, NAT, pings, units, with plain-English hints |
+| **7) Tools** | | Speed test, tuning, 5 keep / 6 undo the pending change, repair, update, uninstall |
 
 ---
 
@@ -255,6 +258,19 @@ gretun pg setup --node pg-node --tunnel gre1 --v4 10.0.0.0/16 --v6 fd10:10::/64 
 ```
 
 A table or interface chosen once is kept in `/etc/gretun/pg/<node>.conf` for later runs.
+
+Traffic:
+
+```bash
+gretun traffic
+```
+```bash
+gretun traffic live
+```
+
+Usage is counted by the heal timer every minute and saved in `/var/lib/gretun/traffic.db`, so it
+survives reboots and tunnel re-creation. Bars and sparklines use Unicode on a UTF-8 terminal and
+plain ASCII otherwise (or with `GRETUN_ASCII=1`).
 
 Tools:
 
@@ -529,9 +545,10 @@ gretun tunnel import manual --if gre1 --role iran
   - سرور ایران: نمایش دوباره‌ی کلید exit، ویرایش تنظیمات نود (اینترفیس WireGuard، رنج‌های کلاینت، جدول routing، تونل؛ `gretun pg edit`)، برگرداندن تنظیمات نود
   - سرور خارج: ویرایش exit (رنج‌های کلاینت، اینترفیس WAN؛ `gretun exit edit`)، حذف exit
   - اینترفیس WireGuard نود خودکار تشخیص داده می‌شود (مثلاً `wg1` اگر هسته‌ی پنل این نام را دارد) و آدرس‌هایش پیش‌فرض رنج‌ها می‌شوند.
-- **۴) وضعیت کلی**
-- **۵) Doctor:** پیدا کردن مشکل‌ها با راهنمایی ساده
-- **۶) ابزارها:** تست سرعت، tuning، تأیید یا برگشت تغییر، تعمیر، به‌روزرسانی، حذف
+- **۴) ترافیک:** مصرف هر تونل و اینترفیس WireGuard (امروز، این ماه، کل، و نمودار ۷ روز اخیر)، سرعت لحظه‌ای با نمودار، و سرعت لحظه‌ای هر پورت فوروارد. از خط فرمان: `gretun traffic` و `gretun traffic live`
+- **۵) وضعیت کلی**
+- **۶) Doctor:** پیدا کردن مشکل‌ها با راهنمایی ساده
+- **۷) ابزارها:** تست سرعت، tuning، تأیید یا برگشت تغییر، تعمیر، به‌روزرسانی، حذف
 
 ### مثال (الف): نود WireGuard پاسارگارد در ایران با خروج از ip6gre
 

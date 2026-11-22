@@ -26,7 +26,7 @@
 set -Eeuo pipefail
 shopt -s nullglob
 
-readonly VERSION="1.5.0"
+readonly VERSION="1.6.0"
 readonly MARK="# Managed by gretun"
 
 # GRETUN_ROOT prefixes every path and switches off systemd/udev calls. It is
@@ -83,7 +83,7 @@ readonly UNREACH_METRIC=4294967295
 ASSUME_YES=0 DRY=0 AUTO_CONFIRM=0 RB_SECS="" FORCE=0 PURGE=0 RAW=0
 REPLACE_HAPROXY=0 BENCH_SERVER=0
 O_ROLE="" O_FAMILY="" O_PEER="" O_LOCAL="" O_MTU="" O_NAME="" O_KEY="" O_IF=""
-O_DEST="" O_PORTS="" O_PROTO="" O_PROXY=0 O_CHECK=0 O_INTERVAL=2
+O_DEST="" O_PORTS="" O_PROTO="" O_PROXY=0 O_CHECK=0 O_INTERVAL=""
 O_NODE="" O_NODE_DIR="" O_TUNNEL="" O_V4="" O_V6="" O_TABLE="" O_WG_IF="" O_WAN=""
 O_URL="" O_TOKEN="" O_TIME=10 O_INNER_PEER="" O_INNER_NET="" O_FILE=""
 ARGS=()
@@ -102,6 +102,11 @@ set_colors() {
     fi
 }
 set_colors
+# Box lines, bars and sparklines use Unicode on a UTF-8 terminal, plain ASCII
+# otherwise (or with GRETUN_ASCII=1).
+UTF=0
+case "${LC_ALL:-${LC_CTYPE:-${LANG:-}}}" in *[Uu][Tt][Ff]-8*|*[Uu][Tt][Ff]8*) UTF=1 ;; esac
+if [[ -n "${GRETUN_ASCII:-}" ]]; then UTF=0; fi
 
 # ---------------------------------------------------------------- output
 jlog() { logger -t gretun -- "$*" >/dev/null 2>&1 || true; }
@@ -224,8 +229,33 @@ hrule() {  # a dim separator line, at most 64 columns wide
     w=$(term_cols)
     (( w > 64 )) && w=64
     printf -v l '%*s' "$((w - 1))" ''
-    printf '%s%s%s\n' "$DIM" "${l// /-}" "$NC"
+    if (( UTF )); then l="${l// /─}"; else l="${l// /-}"; fi
+    printf '%s%s%s\n' "$DIM" "$l" "$NC"
 }
+# bar WIDTH VALUE MAX: a filled bar, e.g. ████████░░░░
+bar() {
+    local w="$1" n f e
+    n=$(awk -v v="${2:-0}" -v m="${3:-0}" -v w="$w" 'BEGIN { if (m <= 0) { print 0; exit }
+        n = int(v / m * w + 0.5); if (n > w) n = w; if (v > 0 && n == 0) n = 1; print n }')
+    printf -v f '%*s' "$n" ''
+    printf -v e '%*s' "$((w - n))" ''
+    if (( UTF )); then printf '%s%s%s%s%s' "$GREEN" "${f// /█}" "$DIM" "${e// /░}" "$NC"
+    else printf '%s%s%s%s%s' "$GREEN" "${f// /#}" "$DIM" "${e// /.}" "$NC"; fi
+}
+# spark MAX VALUE...: a sparkline, one character per value
+spark() {
+    local m="$1" v i out=""
+    local -a c
+    if (( UTF )); then c=(▁ ▂ ▃ ▄ ▅ ▆ ▇ █); else c=(_ . : - '=' + '*' '#'); fi
+    shift
+    for v in "$@"; do
+        i=$(awk -v v="$v" -v m="$m" 'BEGIN { if (m <= 0 || v <= 0) { print 0; exit } i = int(v / m * 7 + 0.5); print (i > 7 ? 7 : i) }')
+        out+="${c[i]}"
+    done
+    printf '%s' "$out"
+}
+arrow_in() { if (( UTF )); then printf '↓'; else printf 'in'; fi; }
+arrow_out() { if (( UTF )); then printf '↑'; else printf 'out'; fi; }
 # The next steps after an action: "next_steps line..."
 next_steps() {
     local l w
@@ -1043,6 +1073,7 @@ fmt_bytes() {
     awk -v b="${1:-0}" 'BEGIN { split("B KB MB GB TB PB", u, " "); i = 1
         while (b >= 1024 && i < 6) { b /= 1024; i++ } printf (i == 1 ? "%d %s" : "%.1f %s"), b, u[i] }'
 }
+iface_index() { cat "/sys/class/net/$1/ifindex" 2>/dev/null; }
 iface_bytes() {  # prints "<rx> <tx>"
     printf '%s %s' "$(cat "/sys/class/net/$1/statistics/rx_bytes" 2>/dev/null || echo 0)" \
         "$(cat "/sys/class/net/$1/statistics/tx_bytes" 2>/dev/null || echo 0)"
@@ -3817,6 +3848,171 @@ cmd_exit_edit() {
 # ======================================================================
 # Extras: status, doctor, bench, tuning, alerts, install/uninstall
 # ======================================================================
+# ---------------------------------------------------------------- traffic
+# Usage per interface (tunnels and the WireGuard interfaces of PasarGuard
+# nodes), counted by heal every minute so it survives reboots and tunnel
+# re-creation. One line per interface in traffic.db:
+#   IFACE|IFINDEX|BOOT_ID|LAST_RX|LAST_TX|DAY|DAY_RX|DAY_TX|MONTH|MON_RX|MON_TX|ALL_RX|ALL_TX
+# Finished days go to traffic-days as DATE|IFACE|RX|TX.
+TRAFFIC_DB="$STATE/traffic.db"
+TRAFFIC_DAYS="$STATE/traffic-days"
+traffic_ifaces() {
+    local n f seen=" "
+    for n in $(tun_list); do seen+="$n "; printf '%s\n' "$n"; done
+    for f in "$PG_DIR"/*.conf; do
+        n=$(conf_val "$f" WG_IF wg0)
+        [[ "$seen" == *" $n "* ]] || { seen+="$n "; printf '%s\n' "$n"; }
+    done
+}
+traffic_kind() {  # a short description of an interface
+    if [[ -f "$TUN_DIR/$1.conf" ]]; then
+        case "$(conf_val "$TUN_DIR/$1.conf" ROLE)" in iran) printf 'tunnel to foreign' ;; foreign) printf 'tunnel to Iran' ;; *) printf tunnel ;; esac
+    else
+        printf 'WireGuard clients'
+    fi
+}
+# traffic_update 0|1: prints the up-to-date rows; with 1 they are also saved.
+traffic_update() {
+    local boot day mon i line out="" days=""
+    local -A row=()
+    boot=$(cat /proc/sys/kernel/random/boot_id 2>/dev/null || echo none)
+    day=$(date +%F) mon=$(date +%Y-%m)
+    if [[ -f "$TRAFFIC_DB" ]]; then
+        while IFS= read -r line; do
+            [[ -z "$line" || "$line" == \#* ]] && continue
+            row[${line%%|*}]="$line"
+        done <"$TRAFFIC_DB"
+    fi
+    for i in $(traffic_ifaces); do
+        local f_ifx f_boot lrx ltx d drx dtx m mrx mtx arx atx ifx rx tx inc_rx=0 inc_tx=0
+        IFS='|' read -r _ f_ifx f_boot lrx ltx d drx dtx m mrx mtx arx atx \
+            <<<"${row[$i]:-$i|||0|0|$day|0|0|$mon|0|0|0|0}"
+        if ifx=$(iface_index "$i"); then
+            read -r rx tx < <(iface_bytes "$i")
+            if [[ "$f_ifx" == "$ifx" && "$f_boot" == "$boot" ]] && (( rx >= lrx && tx >= ltx )); then
+                inc_rx=$((rx - lrx)) inc_tx=$((tx - ltx))
+            else
+                # New interface, recreated tunnel or reboot: its counters started at 0.
+                inc_rx=$rx inc_tx=$tx
+            fi
+            lrx=$rx ltx=$tx f_ifx=$ifx f_boot=$boot
+        fi
+        if [[ "$d" != "$day" ]]; then
+            if (( drx + dtx > 0 )); then days+="$d|$i|$drx|$dtx"$'\n'; fi
+            d=$day drx=0 dtx=0
+        fi
+        if [[ "$m" != "$mon" ]]; then m=$mon mrx=0 mtx=0; fi
+        drx=$((drx + inc_rx)) dtx=$((dtx + inc_tx))
+        mrx=$((mrx + inc_rx)) mtx=$((mtx + inc_tx))
+        arx=$((arx + inc_rx)) atx=$((atx + inc_tx))
+        out+="$i|$f_ifx|$f_boot|$lrx|$ltx|$d|$drx|$dtx|$m|$mrx|$mtx|$arx|$atx"$'\n'
+    done
+    printf '%s' "$out"
+    if (( $1 && ! DRY )) && [[ -n "$out" ]]; then
+        mkdir -p "$STATE"
+        printf '%s\n%s' "$MARK" "$out" >"$TRAFFIC_DB.tmp" && mv -f "$TRAFFIC_DB.tmp" "$TRAFFIC_DB"
+        if [[ -n "$days" ]]; then
+            printf '%s' "$days" >>"$TRAFFIC_DAYS"
+            # About a year of history is plenty.
+            if (( $(wc -l <"$TRAFFIC_DAYS") > 4000 )); then
+                tail -n 3000 "$TRAFFIC_DAYS" >"$TRAFFIC_DAYS.tmp" && mv -f "$TRAFFIC_DAYS.tmp" "$TRAFFIC_DAYS"
+            fi
+        fi
+    fi
+}
+# traffic_sum ROWS FIELD_RX FIELD_TX [tunnels]: total of two fields over the rows
+traffic_sum() {
+    local tf
+    tf=" $(tun_list | tr '\n' ' ') "
+    awk -F'|' -v a="$2" -v b="$3" -v only="${4:-}" -v tf="$tf" '
+        only == "" || index(tf, " " $1 " ") { s += $a + $b } END { printf "%.0f", s }' <<<"$1"
+}
+cmd_traffic() {
+    local rows i line d drx dtx m mrx mtx arx atx k
+    local -a days_=()
+    rows=$(traffic_update 1)
+    [[ -n "$rows" ]] || { info "No tunnel or WireGuard interface to count yet."; return 0; }
+    section "Traffic"
+    printf '%sin = received by this server, out = sent by it. Counted every minute.%s\n' "$DIM" "$NC"
+    while IFS='|' read -r i _ _ _ _ d drx dtx m mrx mtx arx atx; do
+        [[ -n "$i" ]] || continue
+        printf '\n%s%s%s  %s%s%s\n' "$BOLD" "$i" "$NC" "$DIM" "$(traffic_kind "$i")" "$NC"
+        printf '  %-8s %s %-11s %s %-11s %s\n' "today" "$(arrow_in)" "$(fmt_bytes "$drx")" "$(arrow_out)" "$(fmt_bytes "$dtx")" "= $(fmt_bytes $((drx + dtx)))"
+        printf '  %-8s %s %-11s %s %-11s %s\n' "$m" "$(arrow_in)" "$(fmt_bytes "$mrx")" "$(arrow_out)" "$(fmt_bytes "$mtx")" "= $(fmt_bytes $((mrx + mtx)))"
+        printf '  %-8s %s %-11s %s %-11s %s\n' "total" "$(arrow_in)" "$(fmt_bytes "$arx")" "$(arrow_out)" "$(fmt_bytes "$atx")" "= $(fmt_bytes $((arx + atx)))"
+        # The last 7 days (today included) as bars.
+        days_=()
+        if [[ -f "$TRAFFIC_DAYS" ]]; then
+            while IFS='|' read -r k line; do days_+=("$k|$line"); done \
+                < <(awk -F'|' -v i="$i" '$2 == i { s[$1] += $3 + $4 } END { for (d in s) print d "|" s[d] }' "$TRAFFIC_DAYS" | sort | tail -n 6)
+        fi
+        days_+=("$d|$((drx + dtx))")
+        if (( ${#days_[@]} > 1 )); then
+            local max=0 v
+            for line in "${days_[@]}"; do v="${line#*|}"; (( v > max )) && max=$v; done
+            printf '  %slast %s days%s\n' "$DIM" "${#days_[@]}" "$NC"
+            for line in "${days_[@]}"; do
+                v="${line#*|}" k="${line%%|*}"
+                printf '    %s %s %s\n' "${k:5}" "$(bar 16 "$v" "$max")" "$(fmt_bytes "$v")"
+            done
+        fi
+    done <<<"$rows"
+    printf '\n%sLive speed: gretun traffic live   (menu: 4) Traffic > 2)%s\n' "$DIM" "$NC"
+}
+cmd_traffic_live() {
+    local iv="${O_INTERVAL:-1}" cols w n i now prev_t dt rin rout peak line
+    local -a ifs=()
+    local -A prx=() ptx=() hist=() pk=() sesrx=() sestx=()
+    [[ "$iv" =~ ^[0-9]+$ ]] && (( iv >= 1 )) || iv=1
+    mapfile -t ifs < <(traffic_ifaces)
+    for i in "${ifs[@]}"; do iface_exists "$i" || continue; n=1; done
+    (( ${n:-0} )) || die "No tunnel or WireGuard interface is up."
+    exec 9>&-
+    if [[ -t 1 ]]; then printf '\033[?25l'; fi
+    trap 'printf "\033[?25h\n"; exit 0' INT TERM
+    for i in "${ifs[@]}"; do read -r "prx[$i]" "ptx[$i]" < <(iface_bytes "$i"); hist[$i]=""; pk[$i]=0; sesrx[$i]=0; sestx[$i]=0; done
+    prev_t=$(date +%s.%N)
+    while :; do
+        sleep "$iv"
+        now=$(date +%s.%N)
+        dt=$(awk -v a="$now" -v b="$prev_t" 'BEGIN { print (a - b > 0 ? a - b : 1) }')
+        prev_t="$now"
+        cols=$(term_cols)
+        w=$((cols - 34)); (( w > 30 )) && w=30; (( w < 8 )) && w=8
+        if [[ -t 1 ]]; then printf '\033[H\033[2J'; fi
+        printf '%sgretun live traffic%s  %s   %severy %ss, Ctrl+C stops%s\n' "$BOLD" "$NC" "$(date +%H:%M:%S)" "$DIM" "$iv" "$NC"
+        hrule
+        for i in "${ifs[@]}"; do
+            local rx tx
+            if ! iface_exists "$i"; then
+                printf '%s%s%s  %s%s%s\n\n' "$BOLD" "$i" "$NC" "$RED" "down" "$NC"
+                continue
+            fi
+            read -r rx tx < <(iface_bytes "$i")
+            (( rx >= ${prx[$i]:-0} )) || prx[$i]=$rx
+            (( tx >= ${ptx[$i]:-0} )) || ptx[$i]=$tx
+            rin=$(( rx - prx[$i] )) rout=$(( tx - ptx[$i] ))
+            sesrx[$i]=$(( sesrx[$i] + rin )) sestx[$i]=$(( sestx[$i] + rout ))
+            prx[$i]=$rx ptx[$i]=$tx
+            # Rates in bit/s; the bars use the highest rate seen (at least 1 Mbit/s).
+            rin=$(awk -v b="$rin" -v t="$dt" 'BEGIN { printf "%.0f", b * 8 / t }')
+            rout=$(awk -v b="$rout" -v t="$dt" 'BEGIN { printf "%.0f", b * 8 / t }')
+            (( rin > pk[$i] )) && pk[$i]=$rin
+            (( rout > pk[$i] )) && pk[$i]=$rout
+            peak=${pk[$i]}; (( peak < 1000000 )) && peak=1000000
+            hist[$i]="${hist[$i]} $((rin + rout))"
+            read -r -a line <<<"${hist[$i]}"
+            (( ${#line[@]} > w + 10 )) && line=("${line[@]: -$((w + 10))}") && hist[$i]=" ${line[*]}"
+            printf '%s%s%s  %s%s%s\n' "$BOLD" "$i" "$NC" "$DIM" "$(traffic_kind "$i")" "$NC"
+            printf '  %-3s %s %s\n' "$(arrow_in)" "$(bar "$w" "$rin" "$peak")" "$(fmt_rate "$((rin / 8))" 1)"
+            printf '  %-3s %s %s\n' "$(arrow_out)" "$(bar "$w" "$rout" "$peak")" "$(fmt_rate "$((rout / 8))" 1)"
+            local mx=0 v
+            for v in "${line[@]}"; do (( v > mx )) && mx=$v; done
+            printf '  %s%s%s  %speak %s%s\n' "$GREEN" "$(spark "$mx" "${line[@]}")" "$NC" "$DIM" "$(fmt_rate "$((pk[$i] / 8))" 1)" "$NC"
+            printf '  %sthis view: %s %s  %s %s%s\n\n' "$DIM" "$(arrow_in)" "$(fmt_bytes "${sesrx[$i]}")" "$(arrow_out)" "$(fmt_bytes "${sestx[$i]}")" "$NC"
+        done
+    done
+}
 cmd_status() {
     section "Tunnels"
     tunnel_status
@@ -4218,6 +4414,7 @@ cmd_heal() {
         return 0
     fi
     (( DRY )) || mkdir -p "$RUNDIR"
+    (( DRY )) || traffic_update 1 >/dev/null 2>&1 || true
     sync_all quiet || true
     (( DRY )) || watchdog
     fwd_heal || true
@@ -4266,7 +4463,7 @@ pending_notice() {
     rb_pending || return 0
     printf '%s!! Waiting for confirmation:%s %s (%s left)\n' "$YELLOW$BOLD" "$NC" \
         "$(cat "$RB_PENDING/label" 2>/dev/null)" "$(rb_left)"
-    printf '   Keep it: 6) Tools > 5     Undo it: 6) Tools > 6\n'
+    printf '   Keep it: 7) Tools > 5     Undo it: 7) Tools > 6\n'
 }
 # banner: a short dashboard at the top of the main menu
 banner() {
@@ -4311,16 +4508,26 @@ banner() {
                 if [[ "$rtt" == 0 ]]; then st="up <1 ms"; else st="up $rtt ms"; fi
                 col="$GREEN"
             else st="no reply" col="$YELLOW"; fi
+            if (( UTF )); then st="● $st"; fi
             f=$(conf_val "$TUN_DIR/$n.conf" REMOTE)
             printf '%-9s%-*s  %-10s  ' "$lab" "$w" "$n" "$to"
-            if (( 9 + w + 2 + 10 + 2 + 11 + 1 + ${#f} <= cols )); then
-                printf '%s%-11s%s %s%s%s\n' "$col" "$st" "$NC" "$DIM" "$f" "$NC"
+            if (( 9 + w + 2 + 10 + 2 + 13 + 1 + ${#f} <= cols )); then
+                # "● " is 4 bytes but 2 columns: pad by visible width.
+                printf '%s%s%s %s%s%s\n' "$col" "$(cpad "$st" 13)" "$NC" "$DIM" "$f" "$NC"
             else
                 printf '%s%s%s\n' "$col" "$st" "$NC"
             fi
             lab=""
         done
         rm -rf "$tmp"
+    fi
+    if (( ST_TUN )); then
+        local rows
+        rows=$(traffic_update 0 2>/dev/null || true)
+        if [[ -n "$rows" ]]; then
+            printf '%-9stoday %s%s%s   month %s%s%s\n' Traffic "$BOLD" "$(fmt_bytes "$(traffic_sum "$rows" 7 8 tunnels)")" "$NC" \
+                "$BOLD" "$(fmt_bytes "$(traffic_sum "$rows" 10 11 tunnels)")" "$NC"
+        fi
     fi
     if (( ST_FWD )); then
         printf '%-9s%s port(s): TCP %s, UDP %s\n' Forward "$ST_FWD" "$(fwd_count tcp)" "$(fwd_count udp)"
@@ -4430,6 +4637,21 @@ menu_fwd() {
         esac
     done
 }
+menu_traffic() {
+    local c
+    while :; do
+        menu_head
+        choose c "4) Traffic" \
+            "Usage|today, this month, total, last 7 days" \
+            "Live speed|tunnels and WireGuard, Ctrl+C stops" \
+            "$(mi "$ST_FWD" "Live speed per port" "forwarded ports, Ctrl+C stops" "no forwarded ports")"
+        case "$c" in
+            0) return 0 ;; 1) run_action cmd_traffic ;;
+            2) ( cmd_traffic_live ) || true ;;
+            3) ( cmd_fwd_monitor ) || true ;;
+        esac
+    done
+}
 menu_pg_key() {
     local f
     section "Exit key for the foreign server"
@@ -4486,7 +4708,7 @@ menu_tools() {
         tuned=0 pend=0 label=""
         if [[ -f "$SYSCTL_TUNE" ]]; then tuned=1; fi
         if rb_pending; then pend=1 label=$(cat "$RB_PENDING/label" 2>/dev/null || true); fi
-        choose c "6) Tools" \
+        choose c "7) Tools" \
             "#Speed test (iperf3)" \
             "$(mi "$ST_TUN" "Speed test" "from here over a tunnel" "needs a tunnel")" \
             "$(mi "$ST_TUN" "Speed test server" "start this on the other side" "needs a tunnel")" \
@@ -4508,7 +4730,7 @@ menu_tools() {
             2) BENCH_SERVER=1; ( cmd_bench ) || true; BENCH_SERVER=0 ;;
             3) ARGS=(apply); run_action cmd_tune ;; 4) ARGS=(revert); run_action cmd_tune ;;
             5) run_action rb_confirm ;; 6) run_action rb_fire ;;
-            7) ( cmd_heal ) || true; ok "Done. Check the result with: 5) Doctor"; pause ;;
+            7) ( cmd_heal ) || true; ok "Done. Check the result with: 6) Doctor"; pause ;;
             8) O_FILE=""; GRETUN_IN_MENU=1 run_action cmd_update ;;
             9) if ask_update_file O_FILE; then GRETUN_IN_MENU=1 run_action cmd_update; fi; O_FILE="" ;;
             10) run_action cmd_uninstall ;;
@@ -4527,12 +4749,13 @@ menu_main() {
             "GRE tunnel|create, connect, list, edit" \
             "$(mi "$fwd" "Port forwarding" "Iran port -> foreign server" "needs an Iran-side tunnel")" \
             "$(mi "$(( ST_TUN + ST_PG + ST_EXIT ))" "PasarGuard node" "WireGuard clients exit abroad" "needs a tunnel first")" \
+            "$(mi "$ST_TUN" "Traffic" "usage and live speed" "needs a tunnel first")" \
             "Status|everything at a glance" \
             "Doctor|find problems, with hints" \
             "Tools|speed test, tuning, update"
         case "$c" in
-            0) exit 0 ;; 1) menu_tunnel ;; 2) menu_fwd ;; 3) menu_pg ;;
-            4) run_action cmd_status ;; 5) run_action cmd_doctor ;; 6) menu_tools ;;
+            0) exit 0 ;; 1) menu_tunnel ;; 2) menu_fwd ;; 3) menu_pg ;; 4) menu_traffic ;;
+            5) run_action cmd_status ;; 6) run_action cmd_doctor ;; 7) menu_tools ;;
         esac
     done
 }
@@ -4575,6 +4798,10 @@ Usage: gretun                         interactive menu
   exit add --key EXIT_KEY  |  exit add --tunnel gre1 --v4 CIDR [--v6 CIDR] [--wan eth0]
   exit edit [TUNNEL] [--v4 CIDR] [--v6 CIDR|none] [--wan eth0|auto]
   exit list | remove TUNNEL                   foreign server
+
+Traffic
+  traffic                            usage per tunnel: today, this month, total, last 7 days
+  traffic live [--interval 1]        live speed with bars (Ctrl+C stops)
 
 Tools
   status | doctor | heal
@@ -4694,6 +4921,11 @@ main() {
                 add) self_install; cmd_exit_add ;; list|"") cmd_exit_list ;; status|verify) cmd_pg_status ;;
                 remove|rm|del) cmd_exit_remove ;; edit|set) cmd_exit_edit ;;
                 *) die "Unknown: gretun exit $sub" ;;
+            esac ;;
+        traffic|usage)
+            case "$sub" in
+                ""|show) cmd_traffic ;; live) cmd_traffic_live ;;
+                *) die "Unknown: gretun traffic $sub" ;;
             esac ;;
         status) ARGS=("$sub" "${ARGS[@]}"); cmd_status ;;
         doctor) cmd_doctor ;;

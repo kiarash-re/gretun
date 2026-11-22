@@ -1,5 +1,17 @@
 # Changelog
 
+## 1.6.0 — 2026-11-22
+
+- New: traffic tracker. Usage per tunnel and per PasarGuard WireGuard interface (today, this
+  month, total, the last 7 days as bars), counted every minute by heal and saved, so it survives
+  reboots and re-created tunnels. `gretun traffic`, menu 4) Traffic > 1.
+- New: live speed view with in/out bars, a sparkline of the last seconds and the peak.
+  `gretun traffic live [--interval N]`, menu 4) Traffic > 2. The per-port monitor of the
+  forwarder is also in this menu.
+- Dashboard: traffic today and this month; a status dot per tunnel; Unicode lines on UTF-8
+  terminals (plain ASCII otherwise, or with `GRETUN_ASCII=1`).
+- Main menu: 4) Traffic is new, so Status, Doctor and Tools moved to 5, 6 and 7.
+
 ## 1.5.0 — 2026-11-22
 
 Fixes from a full review of the script:
