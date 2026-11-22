@@ -60,7 +60,7 @@ On Iran servers, download the file somewhere else and copy it over with `scp` as
 gretun update --file /root/gretun
 ```
 
-Both are also in the menu: **Tools → Update gretun**.
+Both are also in the menu: **Tools → Update from GitHub** or **Update from a file**.
 
 ### Taking over a server from the old scripts
 
@@ -114,36 +114,44 @@ The interface is not recreated, so there is no downtime. `gre.service` is disabl
 gretun
 ```
 
+The top of the menu is a short dashboard: which server this is (Iran / foreign), each tunnel
+with up/down and ping, forwarded ports, PasarGuard node or exit, and a notice when a change
+waits for confirmation. Items that cannot work on this server (for example "Forward ports"
+without an Iran-side tunnel) are shown with the reason and cannot be chosen. After each action
+gretun prints **What to do next** (for example, on the foreign server: what to paste on the
+Iran server). Every prompt shows its default in `[brackets]`; a wrong value is asked again;
+Enter on an empty key or port prompt cancels.
+
 | Menu | Item | What it does |
 |---|---|---|
-| **1) GRE tunnel** | Foreign server: create + key | Creates the tunnel and prints a connection key |
-| | Iran server: paste a key | Builds the Iran end and pings through it |
-| | Manual setup | Enter both addresses and the tunnel network by hand |
-| | List / status | State, ping RTT/loss (IPv4 and IPv6), traffic |
-| | Show key | Prints the key again (foreign side) |
-| | Remove | Refuses if PasarGuard, an exit or forwarder rules still use the tunnel |
-| | Import | Hand-made `gre1`, or haproxy-forwarder |
-| | Alerts | ntfy URL for tunnel down/up messages |
-| | Edit | MTU, either server's address, tunnel network, role; prints the matching command for the other server |
-| | Forward ports through a tunnel | Iran server: a port here goes through the tunnel to the foreign server (same as menu 2) |
-| **2) Port forwarding through a tunnel** | Add ports | Tunnel (asked only if there are several), ports, TCP/UDP, PROXY v2, health check |
-| | List / Remove | Shows or removes rules |
-| | Status | Services, listening ports, connections, traffic, whether the destination is reachable |
-| | Live monitor | Per-port rates every N seconds |
-| | Rebuild | Regenerates the configs from the rules file |
-| | Uninstall | Removes rules and services (restores the original `haproxy.cfg`) |
-| **3) PasarGuard WG via GRE** | Iran: set up node | Edits `.env`, restarts the node, adds IPv6 policy routing, prints an exit key |
-| | Foreign: add exit | Paste the exit key: forwarding, NAT, return routes |
+| **1) GRE tunnel** | 1 Foreign: new tunnel | Creates the tunnel and prints a connection key |
+| | 2 Iran: paste the key | Builds the Iran end and pings through it |
+| | 3 Iran: manual setup | Enter both addresses and the tunnel network by hand |
+| | 4 List and status | State, ping RTT/loss (IPv4 and IPv6), traffic |
+| | 5 Show the connection key | Prints the key again (foreign side) |
+| | 6 Edit a tunnel | MTU, either server's address, tunnel network, role; prints the matching command for the other server |
+| | 7 Forward ports | Iran server: a port here goes through the tunnel to the foreign server (same as menu 2) |
+| | 8 Remove a tunnel | Refuses if PasarGuard, an exit or forwarder rules still use the tunnel |
+| | 9 Import a tunnel | Hand-made `gre1`, or haproxy-forwarder |
+| | 10 Alerts (ntfy) | ntfy URL for tunnel down/up messages |
+| **2) Port forwarding** | 1 Add ports | Tunnel (asked only if there are several), ports, TCP/UDP, PROXY v2, health check |
+| | 2 List / 3 Remove | Shows or removes rules |
+| | 4 Status | Services, listening ports, connections, traffic, whether the destination is reachable |
+| | 5 Live monitor | Per-port rates every N seconds |
+| | 6 Rebuild configs | Regenerates the configs from the rules file |
+| | 7 Uninstall the forwarder | Removes rules and services (restores the original `haproxy.cfg`) |
+| **3) PasarGuard node** | 1 Iran: set up the node | Edits `.env`, restarts the node, adds IPv6 policy routing, prints an exit key |
+| | 2 Foreign: add the exit | Paste the exit key: forwarding, NAT, return routes |
 | | *Advanced settings* | Both steps offer them (default: no): routing table and WireGuard interface on Iran, WAN interface(s) on the foreign server |
-| | Check everything | All checks, on either server |
-| | Panel settings | What you still have to set in the panel |
-| | Show exit key | Prints the exit key again |
-| | Undo node / remove exit | Puts the old values back |
-| | Edit node setup | WireGuard interface, client subnets, routing table, tunnel (same checks and rollback as setup) |
-| | Edit exit | Client subnets, WAN interface(s) |
+| | 3 Check everything | All checks, on either server |
+| | 4 Panel settings | What you still have to set in the panel |
+| | 5 Show the exit key again | Iran server |
+| | 6 Edit the node setup | WireGuard interface, client subnets, routing table, tunnel (same checks and rollback as setup) |
+| | 7 Undo the node setup | Puts the old `.env` values back |
+| | 8 Edit an exit / 9 Remove an exit | Foreign server: client subnets, WAN interface(s) / NAT and return routes |
 | **4) Status** | | Everything at a glance |
 | **5) Doctor** | | Offloads, MTUs, rules, tables, NAT, pings, units, with plain-English hints |
-| **6) Tools** | | Speed test, tuning, confirm/rollback, repair, update, uninstall |
+| **6) Tools** | | Speed test, tuning, 5 keep / 6 undo the pending change, repair, update, uninstall |
 
 ---
 
@@ -451,7 +459,7 @@ gretun update --file /root/gretun
 
 <div dir="rtl">
 
-هر دو در منو هم هستند: **Tools ← Update gretun**
+هر دو در منو هم هستند: **Tools ← Update from GitHub** یا **Update from a file**
 
 ### انتقال از اسکریپت‌های قبلی
 
@@ -492,19 +500,19 @@ gretun tunnel import manual --if gre1 --role iran
 
 ### منو
 
-با دستور `gretun` منو باز می‌شود:
+با دستور `gretun` منو باز می‌شود. بالای منو خلاصه‌ای از همین سرور است: نقش سرور (ایران یا خارج)، هر تونل با وضعیت و پینگ، تعداد پورت‌های فوروارد، نود پاسارگارد یا exit، و اگر تغییری منتظر تأیید باشد، هشدار آن. گزینه‌هایی که روی این سرور کار نمی‌کنند (مثلاً فوروارد پورت بدون تونل سمت ایران) با دلیلشان نشان داده می‌شوند و قابل انتخاب نیستند. بعد از هر کار، بخش **What to do next** می‌گوید قدم بعدی چیست (مثلاً روی سرور خارج: چه چیزی را در سرور ایران paste کنید). هر سؤال مقدار پیش‌فرضش را در `[ ]` نشان می‌دهد و اگر جواب اشتباه باشد دوباره می‌پرسد.
 
 - **۱) تونل GRE**
-  - سرور خارج: ساخت تونل و نمایش کلید اتصال
-  - سرور ایران: paste کردن کلید
-  - تنظیم دستی
-  - لیست تونل‌ها و وضعیت (پینگ، ترافیک)
-  - نمایش دوباره‌ی کلید
-  - حذف تونل
-  - import
-  - هشدار ntfy
-  - سرور ایران: فوروارد پورت از داخل تونل به سرور خارج (فقط تونل و پورت را می‌پرسد)
-  - ویرایش تونل: MTU، آدرس هر دو سرور، شبکه‌ی داخل تونل، نقش سرور. دستور هم‌سانِ سرور مقابل را هم نشان می‌دهد.
+  - ۱. سرور خارج: ساخت تونل و نمایش کلید اتصال
+  - ۲. سرور ایران: paste کردن کلید
+  - ۳. سرور ایران: تنظیم دستی
+  - ۴. لیست تونل‌ها و وضعیت (پینگ، ترافیک)
+  - ۵. نمایش دوباره‌ی کلید
+  - ۶. ویرایش تونل: MTU، آدرس هر دو سرور، شبکه‌ی داخل تونل، نقش سرور. دستور هم‌سانِ سرور مقابل را هم نشان می‌دهد.
+  - ۷. سرور ایران: فوروارد پورت از داخل تونل به سرور خارج (فقط تونل و پورت را می‌پرسد)
+  - ۸. حذف تونل
+  - ۹. import
+  - ۱۰. هشدار ntfy
 - **۲) فوروارد پورت از داخل تونل** (پورت سرور ایران به سرور خارج)
   - افزودن پورت
   - لیست و حذف
@@ -518,10 +526,8 @@ gretun tunnel import manual --if gre1 --role iran
   - هر دو مرحله «تنظیمات پیشرفته» را هم پیشنهاد می‌دهند (پیش‌فرض: نه). در ایران شماره‌ی جدول routing و اینترفیس WireGuard، و در خارج اینترفیس WAN. در CLI همین‌ها با `--table`، `--wg-if` و `--wan` تعیین می‌شوند.
   - بررسی همه‌چیز
   - تنظیمات لازم در پنل
-  - نمایش دوباره‌ی کلید exit
-  - برگرداندن تنظیمات نود / حذف exit
-  - ویرایش تنظیمات نود: اینترفیس WireGuard، رنج‌های کلاینت، جدول routing، تونل (`gretun pg edit`)
-  - ویرایش exit: رنج‌های کلاینت، اینترفیس WAN (`gretun exit edit`)
+  - سرور ایران: نمایش دوباره‌ی کلید exit، ویرایش تنظیمات نود (اینترفیس WireGuard، رنج‌های کلاینت، جدول routing، تونل؛ `gretun pg edit`)، برگرداندن تنظیمات نود
+  - سرور خارج: ویرایش exit (رنج‌های کلاینت، اینترفیس WAN؛ `gretun exit edit`)، حذف exit
   - اینترفیس WireGuard نود خودکار تشخیص داده می‌شود (مثلاً `wg1` اگر هسته‌ی پنل این نام را دارد) و آدرس‌هایش پیش‌فرض رنج‌ها می‌شوند.
 - **۴) وضعیت کلی**
 - **۵) Doctor:** پیدا کردن مشکل‌ها با راهنمایی ساده
