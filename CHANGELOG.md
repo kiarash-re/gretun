@@ -1,5 +1,34 @@
 # Changelog
 
+## 1.5.0 — 2026-11-22
+
+Fixes from a full review of the script:
+
+- Important: a PasarGuard node restarted with `<name> restart` kept gretun's lock open, so
+  afterwards heal never ran, every command waited 60 s and failed, and the safety rollback could
+  not run. Background processes no longer inherit the lock.
+- Rollback timer: now starts before a change is applied, not after. If the change cuts SSH or
+  gretun stops half-way, the change is still undone. A dropped SSH session no longer stops gretun
+  in the middle of a change. If the timer cannot be started, the change is undone at once.
+- A change that was not confirmed before a reboot is rolled back by the next heal (the timer
+  itself does not survive a reboot).
+- A rollback started by the timer no longer stops a node it restarts (KillMode=process), and it
+  waits up to 30 minutes for the lock instead of giving up after 60 s.
+- `--confirm` keeps a change only when its checks pass.
+- If the rollback snapshot cannot be written, nothing is changed; a damaged snapshot no longer
+  wipes the configuration on rollback.
+- Exit: client subnets that overlap a route or address of the foreign server itself (for example
+  its own wg0 network) are refused; return routes are added, never replaced, in the main table.
+- Firewall: inside a tunnel only the other server's inner address may reach this host, and from
+  the internet into a tunnel only replies are forwarded.
+- Forwarder: a failed change restores the real previous rules (the backup is taken before the
+  rules file changes); heal compares the generated configs instead of validating them every
+  minute, and retries a broken forwarder every 10 minutes without rotating out backups.
+- `uninstall --dry-run` no longer deletes the pending-change state.
+- Without a terminal, commands that need an answer now say so (and how: `-y` or a CLI option)
+  instead of silently doing nothing. Ctrl+D at a `[Y/n]` question is no longer a yes.
+- `fwd remove` rejects input that is not a port number instead of crashing.
+
 ## 1.4.0 — 2026-11-22
 
 - Removed: forwarding a port straight to a foreign IPv6 address without a tunnel (menu and

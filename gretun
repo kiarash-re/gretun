@@ -26,7 +26,7 @@
 set -Eeuo pipefail
 shopt -s nullglob
 
-readonly VERSION="1.4.0"
+readonly VERSION="1.5.0"
 readonly MARK="# Managed by gretun"
 
 # GRETUN_ROOT prefixes every path and switches off systemd/udev calls. It is
@@ -180,12 +180,17 @@ ask() {  # ask VAR "Prompt" [default]
 confirm() {  # confirm "Question" [Y|N]
     local d="${2:-N}" a=""
     if (( ASSUME_YES )); then return 0; fi
-    if (( ! HAVE_TTY )); then [[ "$d" == Y ]]; return; fi
+    if (( ! HAVE_TTY )); then
+        [[ "$d" == Y ]] && return 0
+        warn "Not done: \"$1\" needs a yes (no terminal here; add -y to answer yes)."
+        return 1
+    fi
     if [[ "$d" == Y ]]; then
-        read -r -p "$1 [Y/n]: " a </dev/tty || true
+        # End of input (Ctrl+D, SSH gone) is never a yes.
+        read -r -p "$1 [Y/n]: " a </dev/tty || return 1
         [[ -z "$a" || "$a" == [yY]* ]]
     else
-        read -r -p "$1 [y/N]: " a </dev/tty || true
+        read -r -p "$1 [y/N]: " a </dev/tty || return 1
         [[ "$a" == [yY]* ]]
     fi
 }
@@ -197,6 +202,9 @@ pause() {
 choose() {  # choose VAR "Title" option... -> VAR=1..N (0 = back)
     local __ch_var="$1" __ch_title="$2" __ch_n=1 __ch_item __ch_ans="" __ch_zero=Back
     shift 2
+    if (( ASSUME_YES || ! HAVE_TTY )); then
+        die "A choice is needed (\"$__ch_title\") but there is no terminal: pass it as a CLI option (see: gretun help)."
+    fi
     if [[ "$__ch_title" == "Main menu" ]]; then __ch_zero=Exit; fi
     printf '\n%s%s%s\n' "$BOLD" "$__ch_title" "$NC"
     for __ch_item in "$@"; do
@@ -215,13 +223,13 @@ choose() {  # choose VAR "Title" option... -> VAR=1..N (0 = back)
 }
 
 # ---------------------------------------------------------------- locking
-take_lock() {  # take_lock [nonblock]
+take_lock() {  # take_lock [nonblock|SECONDS]
     (( DRY )) && return 0
     mkdir -p "$(dirname "$LOCK")"
     exec 9>"$LOCK"
     if [[ "${1:-}" == nonblock ]]; then
         flock -n 9 || exit 0
-    elif ! flock -w 60 9; then
+    elif ! flock -w "${1:-60}" 9; then
         die "Another gretun command is running (lock $LOCK)."
     fi
 }
@@ -469,7 +477,7 @@ test_daemon() {  # test_daemon start|reload|stop UNIT
             fi ;;
         start:"$UDP_UNIT")
             if test_daemon_active "$2"; then kill -HUP "$(cat "$pf")"; return 0; fi
-            setsid nginx -c "$UDP_CFG" >/dev/null 2>&1 &
+            setsid nginx -c "$UDP_CFG" >/dev/null 2>&1 9>&- &
             printf '%s\n' "$!" >"$pf"
             sleep 0.5 ;;
         reload:"$UDP_UNIT") kill -HUP "$(cat "$pf")" ;;
@@ -527,10 +535,36 @@ rb_begin() {  # rb_begin "label"
         if [[ -e "$R/$p" ]]; then present+=("$p"); else printf '%s\n' "$p" >>"$RB_PENDING/absent"; fi
     done
     if (( ${#present[@]} )); then
-        tar -C "${R:-/}" -czf "$RB_PENDING/snapshot.tgz" "${present[@]}"
+        if ! tar -C "${R:-/}" -czf "$RB_PENDING/snapshot.tgz" "${present[@]}"; then
+            rm -rf "$RB_PENDING"
+            die "Could not take the rollback snapshot (disk full?); nothing was changed."
+        fi
     fi
     RB_ACTIVE=1
     jlog "rollback snapshot taken: $1"
+    # The timer runs from now on, not only after the change: if the change cuts
+    # the SSH session or gretun stops half-way, the timer still undoes it.
+    rb_start_timer "${RB_SECS:-900}"
+    # A dropped SSH session must not stop gretun half-way through a change.
+    trap '' HUP
+}
+rb_start_timer() {  # rb_start_timer SECONDS: (re)starts the rollback timer
+    if (( TEST_MODE )); then
+        kill "$(cat "$RB_PENDING/timer.pid" 2>/dev/null)" 2>/dev/null || true
+        setsid bash -c "sleep $1; exec \"\$0\" rollback --fire" "$SELF" >/dev/null 2>&1 9>&- &
+        printf '%s\n' "$!" >"$RB_PENDING/timer.pid"
+    else
+        systemctl stop gretun-rollback.timer >/dev/null 2>&1 || true
+        systemctl reset-failed gretun-rollback.service gretun-rollback.timer >/dev/null 2>&1 || true
+        # KillMode=process: a node restarted by the rollback stays running.
+        if ! systemd-run --quiet --unit gretun-rollback --on-active="${1}s" \
+            --timer-property=AccuracySec=1s --property=KillMode=process "$SELF" rollback --fire 9>&-; then
+            err "Could not start the rollback timer."
+            if [[ -f "$RB_PENDING/deadline" ]] || (( RB_ACTIVE )); then rb_fire; fi
+            exit 1
+        fi
+    fi
+    printf '%s\n' "$(( $(date +%s) + $1 ))" >"$RB_PENDING/deadline"
 }
 rb_note_sysctl() {
     (( RB_ACTIVE && ! DRY )) || return 0
@@ -552,29 +586,21 @@ rb_undo() {  # rb_undo CMD...: run (in reverse order) on rollback
     (( RB_ACTIVE && ! DRY )) || return 0
     { printf '%q ' "$@"; printf '\n'; } >>"$RB_PENDING/undo"
 }
-rb_arm() {  # rb_arm DEFAULT_SECONDS: starts the timer, then asks to confirm
+rb_arm() {  # rb_arm DEFAULT_SECONDS [CHECKS_FAILED]: restarts the timer, then asks to confirm
     local secs="${RB_SECS:-$1}" a=""
     (( RB_ACTIVE )) || return 0
-    RB_ACTIVE=0
     if (( DRY )); then
+        RB_ACTIVE=0
         printf '%s[dry-run]%s rollback timer %ss\n' "$DIM" "$NC" "$secs"
         return 0
     fi
-    if (( TEST_MODE )); then
-        setsid bash -c "sleep $secs; exec \"\$0\" rollback --fire" "$SELF" >/dev/null 2>&1 &
-        printf '%s\n' "$!" >"$RB_PENDING/timer.pid"
-    else
-        systemctl stop gretun-rollback.timer >/dev/null 2>&1 || true
-        systemctl reset-failed gretun-rollback.service gretun-rollback.timer >/dev/null 2>&1 || true
-        systemd-run --quiet --unit gretun-rollback --on-active="${secs}s" \
-            --timer-property=AccuracySec=1s "$SELF" rollback --fire \
-            || die "Could not start the rollback timer; nothing is kept."
-    fi
-    printf '%s\n' "$(( $(date +%s) + secs ))" >"$RB_PENDING/deadline"
+    rb_start_timer "$secs"
+    RB_ACTIVE=0
+    trap - HUP
     printf '\n%sSafety timer:%s this change is undone automatically in %ss.\n' "$YELLOW$BOLD" "$NC" "$secs"
     if (( AUTO_CONFIRM )); then
-        rb_confirm
-        return 0
+        if (( ${2:-0} == 0 )); then rb_confirm; return 0; fi
+        warn "--confirm: not kept automatically because some checks failed."
     fi
     if (( HAVE_TTY && ! ASSUME_YES )); then
         # An explicit answer is required: Enter alone must never undo the change.
@@ -638,12 +664,16 @@ rb_fire() {
             eval "$line" >/dev/null 2>&1 || true
         done
     fi
-    while read -r path; do rm -rf -- "$R/${path:?}"; done <"$RB_PENDING/absent"
-    for path in "${RB_SNAP_PATHS[@]}"; do
-        if [[ -d "$R/$path" ]]; then rm -rf -- "$R/${path:?}"; fi
-    done
-    if [[ -f "$RB_PENDING/snapshot.tgz" ]]; then
-        tar -C "${R:-/}" -xzf "$RB_PENDING/snapshot.tgz"
+    if [[ -f "$RB_PENDING/snapshot.tgz" ]] && ! tar -tzf "$RB_PENDING/snapshot.tgz" >/dev/null 2>&1; then
+        err "The rollback snapshot is damaged; gretun's configuration is left as it is."
+    else
+        while read -r path; do rm -rf -- "$R/${path:?}"; done <"$RB_PENDING/absent"
+        for path in "${RB_SNAP_PATHS[@]}"; do
+            if [[ -d "$R/$path" ]]; then rm -rf -- "$R/${path:?}"; fi
+        done
+        if [[ -f "$RB_PENDING/snapshot.tgz" ]]; then
+            tar -C "${R:-/}" -xzf "$RB_PENDING/snapshot.tgz"
+        fi
     fi
     if [[ -f "$RB_PENDING/files/index" ]]; then
         while read -r kind n path; do
@@ -1027,7 +1057,7 @@ nft_set() {  # nft_set item... -> { "a", "b" } or a single item
 #   GRETUN-IN/-FWD   the same accepts for iptables/ufw/docker setups
 fw_sync() {
     local f n t wan4 wan6 nl=$'\n' s
-    local -a peers4=() peers6=() tuns=() fwd=() nat4=() nat6=() pg_ifs=()
+    local -a peers4=() peers6=() tuns=() fwd=() nat4=() nat6=() pg_ifs=() inner=()
     local ipt4="" ipt6=""
     for n in $(tun_list); do
         tun_load "$n" || continue
@@ -1039,8 +1069,16 @@ fw_sync() {
             peers6+=("${C[REMOTE]}")
             ipt6+="-A GRETUN-IN -s ${C[REMOTE]}/128 -p 47 -m comment --comment gretun -j ACCEPT$nl"
         fi
-        ipt4+="-A GRETUN-IN -i $n -m comment --comment gretun -j ACCEPT$nl"
-        ipt6+="-A GRETUN-IN -i $n -m comment --comment gretun -j ACCEPT$nl"
+        # Inside the tunnel only the other server itself may reach this host
+        # (clients routed through the tunnel must not bypass the host firewall).
+        if [[ -n "${C[IN4_PEER]:-}" ]]; then
+            ipt4+="-A GRETUN-IN -i $n -s ${C[IN4_PEER]}/32 -m comment --comment gretun -j ACCEPT$nl"
+            inner+=("$n ip ${C[IN4_PEER]}")
+        fi
+        if [[ -n "${C[IN6_PEER]:-}" ]]; then
+            ipt6+="-A GRETUN-IN -i $n -s ${C[IN6_PEER]}/128 -m comment --comment gretun -j ACCEPT$nl"
+            inner+=("$n ip6 ${C[IN6_PEER]}")
+        fi
     done
     for f in "$PG_DIR"/*.conf; do
         conf_load "$f" || continue
@@ -1057,11 +1095,11 @@ fw_sync() {
         subs4=$(cget V4_SUBNETS) subs6=$(cget V6_SUBNETS)
         tun_load "$t" || continue
         if [[ -n "$wan4" ]]; then
-            fwd+=("$t $wan4" "$wan4 $t")
+            fwd+=("$t $wan4" "$wan4 $t est")
             for s in "$(cidr_norm "${C[IN4_LOCAL]}/${C[IN4_PREFIX]}")" $(split_list "$subs4"); do nat4+=("$wan4 $s"); done
         fi
         if [[ -n "$wan6" ]]; then
-            [[ "$wan6" == "$wan4" ]] || fwd+=("$t $wan6" "$wan6 $t")
+            [[ "$wan6" == "$wan4" ]] || fwd+=("$t $wan6" "$wan6 $t est")
             for s in "$(cidr_norm "${C[IN6_LOCAL]}/64")" $(split_list "$subs6"); do nat6+=("$wan6 $s"); done
         fi
     done
@@ -1071,13 +1109,24 @@ fw_sync() {
     local rules="" text="" pair a b
     if (( ${#peers4[@]} )); then rules+="        ip saddr $(nft_set "${peers4[@]}") ip protocol 47 accept$nl"; fi
     if (( ${#peers6[@]} )); then rules+="        ip6 saddr $(nft_set "${peers6[@]}") meta l4proto 47 accept$nl"; fi
-    if (( ${#tuns[@]} )); then rules+="        iifname $(nft_set "${tuns[@]}") accept$nl"; fi
+    local fam_ peer_ est
+    for pair in "${inner[@]}"; do
+        read -r a fam_ peer_ <<<"$pair"
+        rules+="        iifname \"$a\" $fam_ saddr $peer_ accept$nl"
+    done
     local frules=""
     for pair in "${fwd[@]}"; do
-        read -r a b <<<"$pair"
-        frules+="        iifname \"$a\" oifname \"$b\" accept$nl"
-        ipt4+="-A GRETUN-FWD -i $a -o $b -m comment --comment gretun -j ACCEPT$nl"
-        ipt6+="-A GRETUN-FWD -i $a -o $b -m comment --comment gretun -j ACCEPT$nl"
+        read -r a b est <<<"$pair"
+        # From the internet into the tunnel only replies (no new connections to clients).
+        if [[ "$est" == est ]]; then
+            frules+="        iifname \"$a\" oifname \"$b\" ct state established,related accept$nl"
+            ipt4+="-A GRETUN-FWD -i $a -o $b -m conntrack --ctstate ESTABLISHED,RELATED -m comment --comment gretun -j ACCEPT$nl"
+            ipt6+="-A GRETUN-FWD -i $a -o $b -m conntrack --ctstate ESTABLISHED,RELATED -m comment --comment gretun -j ACCEPT$nl"
+        else
+            frules+="        iifname \"$a\" oifname \"$b\" accept$nl"
+            ipt4+="-A GRETUN-FWD -i $a -o $b -m comment --comment gretun -j ACCEPT$nl"
+            ipt6+="-A GRETUN-FWD -i $a -o $b -m comment --comment gretun -j ACCEPT$nl"
+        fi
     done
     if (( ${#tuns[@]} )); then
         local ts
@@ -1189,7 +1238,11 @@ route_cmd() {  # route_cmd add|del "FAM|TYPE|DST|TABLE|VIA|DEV"
     local fam type dst tbl via dev
     IFS='|' read -r fam type dst tbl via dev <<<"$2"
     local -a a=(ip "-$fam" route)
-    if [[ "$1" == add ]]; then a+=(replace); else a+=(del); fi
+    # In the main table "add", never "replace": replace would take over a route
+    # of the server itself with the same prefix (e.g. its own wg0 network).
+    if [[ "$1" == add && "$tbl" == main ]]; then a+=(add)
+    elif [[ "$1" == add ]]; then a+=(replace)
+    else a+=(del); fi
     if [[ "$type" != unicast ]]; then a+=("$type"); fi
     a+=("$dst" table "$tbl")
     if [[ -n "$via" ]]; then a+=(via "$via"); fi
@@ -2320,11 +2373,12 @@ fwd_verify() {
     done
     return 1
 }
-# fwd_apply: rules file -> configs -> services. On failure the previous
-# rules and configs are restored and reloaded.
+# fwd_apply [BACKUP_DIR]: rules file -> configs -> services. On failure the
+# previous rules and configs (BACKUP_DIR, taken before the rules file changed)
+# are restored and reloaded.
 fwd_apply() {
     fwd_load
-    local ntcp nudp tmp bk rc=0
+    local ntcp nudp tmp bk="${1:-}" rc=0
     ntcp=$(fwd_count tcp) nudp=$(fwd_count udp)
     if (( ntcp )); then ensure_haproxy || return 1; claim_haproxy_cfg || return 1; write_haproxy_dropin; fi
     if (( nudp )); then ensure_udp_engine || return 1; fi
@@ -2340,7 +2394,9 @@ fwd_apply() {
         rm -rf "$tmp"
         return 0
     fi
-    bk=$(fwd_backup)
+    # In heal mode nothing is restored, so no backup either (it would rotate the
+    # good backups out when a broken forwarder is retried).
+    if [[ -z "$bk" ]] && (( ! HEAL_MODE )); then bk=$(fwd_backup); fi
     if (( ntcp )); then
         install_cfg "$tmp/haproxy.cfg" "$HAPROXY_CFG" haproxy
         svc_up haproxy || rc=1
@@ -2371,10 +2427,12 @@ fwd_apply() {
 }
 # fwd_commit: writes the in-memory rules and applies them (rolls back on failure).
 fwd_commit() {
-    local prev=""
+    local prev="" bk=""
     if [[ -f "$RULES" ]]; then prev=$(cat "$RULES"); fi
+    # The backup must hold the old rules, so it is taken before they are replaced.
+    if (( ! DRY )); then bk=$(fwd_backup); fi
     write_file "$RULES" 640 "$(fwd_text)" || true
-    if fwd_apply; then
+    if fwd_apply "$bk"; then
         units_sync
         return 0
     fi
@@ -2536,6 +2594,7 @@ cmd_fwd_remove() {
     fi
     local removed=""
     for p in "${list[@]}"; do
+        valid_port "$p" || { warn "Not a port number: $p"; continue; }
         i=$(fwd_find "$((10#$p))") || { warn "No rule on port $p."; continue; }
         ufw_ports delete "${F_LISTEN[i]} ${F_DPORT[i]}" "${F_OPTS[i]}"
         fwd_del "$((10#$p))"
@@ -2634,23 +2693,31 @@ fwd_heal() {
     fwd_load
     (( ${#F_LISTEN[@]} )) || return 0
     have haproxy || (( ! $(fwd_count tcp) )) || { warn "heal: haproxy is not installed."; return 0; }
-    local tmp need=0
+    local tmp need=0 stamp="$RUNDIR/fwd-heal-failed"
+    # Compare the generated text only; validation (haproxy -c, nginx -t) runs
+    # only when something has to be re-applied, not every minute.
     tmp=$(mktemp -d)
-    if fwd_build "$tmp" 2>/dev/null; then
-        if (( $(fwd_count tcp) )); then
+    if (( $(fwd_count tcp) )); then
+        gen_haproxy "$tmp/haproxy.cfg" 1
+        if ! cmp -s "$tmp/haproxy.cfg" "$HAPROXY_CFG"; then
+            gen_haproxy "$tmp/haproxy.cfg" 0
             cmp -s "$tmp/haproxy.cfg" "$HAPROXY_CFG" || need=1
-            svc_active haproxy || need=1
         fi
-        if (( $(fwd_count udp) )); then
-            cmp -s "$tmp/udp.conf" "$UDP_CFG" || need=1
-            svc_active "$UDP_UNIT" || need=1
-        fi
+        svc_active haproxy || need=1
+    fi
+    if (( $(fwd_count udp) )); then
+        gen_udp "$tmp/udp.conf"
+        cmp -s "$tmp/udp.conf" "$UDP_CFG" || need=1
+        svc_active "$UDP_UNIT" || need=1
     fi
     rm -rf "$tmp"
-    fwd_verify || need=1
+    (( need )) || fwd_verify || need=1
     if (( need )); then
+        # A forwarder that cannot be repaired is retried every 10 minutes, not every minute.
+        if [[ -f "$stamp" ]] && (( $(date +%s) - $(stat -c %Y "$stamp" 2>/dev/null || echo 0) < 600 )); then return 0; fi
         jlog "heal: re-applying the forwarder"
-        fwd_apply || warn "heal: the forwarder could not be repaired."
+        if fwd_apply; then rm -f "$stamp"
+        else warn "heal: the forwarder could not be repaired (next try in 10 minutes)."; (( DRY )) || touch "$stamp"; fi
     fi
     nft list table inet "$NFT_FWD" >/dev/null 2>&1 || counters_update
 }
@@ -2830,17 +2897,18 @@ pg_restart() {  # pg_restart DIR NAME CLI CONTAINER WG_IF
     : >"$log"
     if unit=$(pg_unit "$name"); then
         info "Restarting the node: systemctl restart $unit ..."
-        timeout 120 systemctl restart "$unit" || warn "systemctl restart $unit failed; see: journalctl -u $unit"
+        timeout 120 systemctl restart "$unit" 9>&- || warn "systemctl restart $unit failed; see: journalctl -u $unit"
     elif cf=$(compose_file "$dir") && have docker; then
         info "Recreating the node container (docker compose up -d --force-recreate)..."
         if docker compose version >/dev/null 2>&1; then
-            (cd "$dir" && timeout 180 docker compose -f "$cf" up -d --force-recreate) >"$log" 2>&1 || warn "docker compose failed; see $log"
+            (cd "$dir" && timeout 180 docker compose -f "$cf" up -d --force-recreate) >"$log" 2>&1 9>&- || warn "docker compose failed; see $log"
         else
-            (cd "$dir" && timeout 180 docker-compose -f "$cf" up -d --force-recreate) >"$log" 2>&1 || warn "docker-compose failed; see $log"
+            (cd "$dir" && timeout 180 docker-compose -f "$cf" up -d --force-recreate) >"$log" 2>&1 9>&- || warn "docker-compose failed; see $log"
         fi
     elif [[ -n "$cli" && -x "$cli" ]]; then
         info "Restarting the node with '$name restart' (stopped automatically within 90 s)..."
-        setsid "$cli" restart </dev/null >"$log" 2>&1 &
+        # 9>&-: the node runs on after gretun exits and must not keep gretun's lock.
+        setsid "$cli" restart </dev/null >"$log" 2>&1 9>&- &
         pid=$!
         for (( i = 1; i <= 90; i++ )); do
             sleep 1
@@ -3135,13 +3203,14 @@ EOF
         hint "gretun finishes the IPv6 routes and offload settings automatically then (udev + heal timer)."
     fi
     sync_all quiet || true
-    pg_verify "$name" || true
+    local vfail=0
+    pg_verify "$name" || vfail=1
     section "Exit key for the foreign server"
     printf '%s%s%s\n' "$GREEN$BOLD" "$(exit_key "$tun" "$v4" "$v6")" "$NC"
     printf 'On the foreign server run:  gretun exit add --key <the key above>\n'
     printf '(menu: 3) PasarGuard -> 2) Foreign server: add the exit)\n'
     pg_panel_help "$v4" "$v6"
-    rb_arm 600
+    rb_arm 600 "$vfail"
 }
 pg_panel_help() {  # pg_panel_help V4 V6
     section "Still to do in the PasarGuard panel"
@@ -3391,13 +3460,15 @@ cmd_exit_add() {
   forwarding:     on (accept_ra=2 on the WAN first, so its IPv6 stays)
 EOF
     [[ -n "$(wan_if 6)" || "$wan6" != auto ]] || warn "This server has no IPv6 default route: clients will get no IPv6."
+    exit_subnets_free "$tun" "$v4" "$v6" || die "Not applied: the exit would change this server's own routing."
     confirm "Apply?" Y || return 0
     rb_begin "exit via $tun"
     C=([TUNNEL]="$tun" [V4_SUBNETS]="$v4" [V6_SUBNETS]="$v6" [WAN4]="$wan4" [WAN6]="$wan6")
     write_file "$EXIT_DIR/$tun.conf" 640 "$(conf_text "${EXIT_KEYS[@]}")" || true
     sync_all || warn "Some parts could not be applied."
-    exit_verify "$tun" || true
-    rb_arm 600
+    local vfail=0
+    exit_verify "$tun" || vfail=1
+    rb_arm 600 "$vfail"
 }
 exit_verify() {  # exit_verify TUNNEL
     local f="$EXIT_DIR/$1.conf" fails=0 t s w out p4
@@ -3465,6 +3536,29 @@ cmd_exit_remove() {
     rb_arm 300
 }
 
+# exit_subnets_free TUNNEL V4 V6: the client subnets must not overlap a route
+# or an address of this server (other than gretun's own return routes).
+exit_subnets_free() {
+    local x fam p bad=0
+    for x in $2 $3; do
+        fam=4
+        if [[ "$x" == *:* ]]; then fam=6; fi
+        while read -r p; do
+            [[ -n "$p" ]] || continue
+            if cidr_overlap "$x" "$p"; then
+                err "$x overlaps $p, which this server already uses (its own route or address)."
+                bad=1
+            fi
+        done < <( { ip "-$fam" -o addr show 2>/dev/null | awk '{print $4}'
+                    ip "-$fam" route show table main 2>/dev/null | awk '$0 !~ / proto 147( |$)/ {
+                        d = $1; if (d ~ /^(unicast|local|broadcast|blackhole|unreachable|prohibit|throw)$/) d = $2
+                        if (d != "default" && d !~ /^(fe80|ff)/) print d }'; } | sort -u)
+    done
+    if (( bad )); then
+        hint "Use other client subnets in the panel (the WireGuard core's Address) on the Iran server."
+        return 1
+    fi
+}
 # exit edit: client subnets and WAN interfaces of an exit.
 cmd_exit_edit() {
     local t="${ARGS[0]:-$O_TUNNEL}" f c v4 v6 w4 w6
@@ -3503,13 +3597,15 @@ cmd_exit_edit() {
     section "Exit via $t"
     printf '  IPv4 subnets: %s -> %s\n  IPv6 subnets: %s -> %s\n  WAN:          %s/%s -> %s/%s\n' \
         "${o_v4:-none}" "${v4:-none}" "${o_v6:-none}" "${v6:-none}" "$o_w4" "$o_w6" "$w4" "$w6"
+    exit_subnets_free "$t" "$v4" "$v6" || die "Not applied: the exit would change this server's own routing."
     confirm "Apply?" Y || return 0
     rb_begin "edit exit $t"
     C=([TUNNEL]="$t" [V4_SUBNETS]="$v4" [V6_SUBNETS]="$v6" [WAN4]="$w4" [WAN6]="$w6")
     write_file "$f" 640 "$(conf_text "${EXIT_KEYS[@]}")" || true
     sync_all || warn "Some parts could not be applied."
-    exit_verify "$t" || true
-    rb_arm 300
+    local vfail=0
+    exit_verify "$t" || vfail=1
+    rb_arm 300 "$vfail"
 }
 
 # ======================================================================
@@ -3875,7 +3971,7 @@ cmd_uninstall() {
         daemon_reload
     fi
     remove_file "$SYSCTL_FWD"
-    rm -rf "$RB_PENDING" "$RUNDIR"
+    run rm -rf "$RB_PENDING" "$RUNDIR"
     if (( PURGE )); then
         run rm -rf "$ETC" "$STATE"
         (( TEST_MODE )) || remove_file "$INSTALL_PATH"
@@ -3898,6 +3994,13 @@ cmd_tunnel_down() { tunnel_delete_iface "$1"; }
 cmd_heal() {
     HEAL_MODE=1
     take_lock nonblock
+    # The rollback timer does not survive a reboot: an expired change is undone here.
+    if (( ! DRY )) && rb_pending && [[ -f "$RB_PENDING/deadline" ]] \
+        && (( $(cat "$RB_PENDING/deadline" 2>/dev/null || echo 0) <= $(date +%s) )); then
+        warn "A change was not confirmed before its deadline (reboot?); rolling it back."
+        rb_fire
+        return 0
+    fi
     (( DRY )) || mkdir -p "$RUNDIR"
     sync_all quiet || true
     (( DRY )) || watchdog
@@ -4148,7 +4251,8 @@ main() {
         offload-apply) offload_apply "${sub:?}"; return ;;
         heal) cmd_heal; return ;;
         pg-restart) shift; pg_restart "$@" || true; sync_all quiet || true; return ;;
-        rollback) take_lock; rb_fire; return ;;
+        # The timer's rollback waits long: a menu left open must not cancel it.
+        rollback) take_lock 1800; rb_fire; return ;;
         confirm) take_lock; rb_confirm; return ;;
     esac
     if [[ "$cmd" == menu ]]; then menu_main; return; fi
