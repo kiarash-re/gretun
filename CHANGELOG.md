@@ -1,5 +1,28 @@
 # Changelog
 
+## 1.5.0 — 2026-11-22
+
+Menu and prompts only; the CLI, its flags and the networking logic are unchanged.
+
+- Dashboard at the top of the menu: this server's role (Iran / foreign), IPs, each tunnel
+  with up/down and ping (pinged in parallel), forwarded ports (TCP/UDP), PasarGuard node,
+  exit, alerts, and a notice with the time left when a change waits for confirmation.
+  On a new server it says where to start.
+- Menus are grouped (e.g. "Iran server" / "Foreign server" in PasarGuard), each item has a
+  short dim hint, and items that cannot work here are shown with the reason
+  (e.g. "needs an Iran-side tunnel") instead of failing after you choose them.
+  Tunnel menu order: new tunnel (1-3), list, key, edit, forward ports, remove, import, alerts.
+  PasarGuard menu: set up (1-2), check, panel, Iran items (5-7), foreign items (8-9).
+- Keys and ports are checked as you type and asked again: a bad connection key, exit key,
+  port list or ntfy URL no longer ends the action; Enter on an empty prompt cancels.
+- Summaries before applying (new tunnel, forwarded ports) and a "What to do next" block after
+  creating a tunnel, forwarding ports, setting up a node or an exit.
+- Narrow screens (Termius): menus fit 60 columns; tunnel status and forwarder status are
+  printed as short blocks on terminals narrower than the table (piped output keeps the table).
+- Tables line up with `NO_COLOR` / `--no-color` and when piped (coloured cells were padded
+  as if the colour codes had width).
+- `fwd remove` with a non-numeric port now warns instead of stopping with a shell error.
+
 ## 1.4.0 — 2026-11-22
 
 - Removed: forwarding a port straight to a foreign IPv6 address without a tunnel (menu and

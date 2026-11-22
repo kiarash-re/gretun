@@ -26,7 +26,7 @@
 set -Eeuo pipefail
 shopt -s nullglob
 
-readonly VERSION="1.4.0"
+readonly VERSION="1.5.0"
 readonly MARK="# Managed by gretun"
 
 # GRETUN_ROOT prefixes every path and switches off systemd/udev calls. It is
@@ -90,6 +90,7 @@ ARGS=()
 HEAL_MODE=0
 HAVE_TTY=0
 if (exec </dev/tty) 2>/dev/null; then HAVE_TTY=1; fi
+IN_MENU=0    # 1 inside the interactive menu: summaries and "apply?" questions
 
 RED="" GREEN="" YELLOW="" BLUE="" BOLD="" DIM="" NC=""
 set_colors() {
@@ -191,26 +192,105 @@ confirm() {  # confirm "Question" [Y|N]
 }
 pause() {
     if (( HAVE_TTY && ! ASSUME_YES )); then
-        read -r -p "Press Enter to continue..." _ </dev/tty || true
+        printf '\n'
+        read -r -p "Press Enter to go back to the menu..." _ </dev/tty || true
     fi
 }
-choose() {  # choose VAR "Title" option... -> VAR=1..N (0 = back)
-    local __ch_var="$1" __ch_title="$2" __ch_n=1 __ch_item __ch_ans="" __ch_zero=Back
+# Width of the terminal (Termius on a phone is often 60-80 columns).
+term_cols() {
+    local c=""
+    if (( HAVE_TTY )); then c=$(tput cols 2>/dev/null </dev/tty) || c=""; fi
+    [[ "$c" =~ ^[0-9]+$ ]] && (( c >= 20 )) || c="${COLUMNS:-80}"
+    [[ "$c" =~ ^[0-9]+$ ]] || c=80
+    printf '%s' "$c"
+}
+# cpad TEXT WIDTH: TEXT padded to WIDTH visible columns (colour codes take none),
+# so tables line up with and without colour.
+cpad() {
+    local t="$1" re=$'\033''\[[0-9;]*m'
+    while [[ "$t" =~ $re ]]; do t="${t/"${BASH_REMATCH[0]}"/}"; done
+    printf '%s%*s' "$1" "$(( $2 > ${#t} ? $2 - ${#t} : 0 ))" ''
+}
+# narrow WIDTH: output goes to a terminal narrower than WIDTH, so wide tables
+# are printed as short blocks instead (piped output keeps the table).
+narrow() { [[ -t 1 ]] && (( $(term_cols) < $1 )); }
+hrule() {  # a dim separator line, at most 64 columns wide
+    local w l
+    w=$(term_cols)
+    (( w > 64 )) && w=64
+    printf -v l '%*s' "$((w - 1))" ''
+    printf '%s%s%s\n' "$DIM" "${l// /-}" "$NC"
+}
+# The next steps after an action: "next_steps line..."
+next_steps() {
+    local l w
+    w=$(term_cols)
+    (( w > 100 )) && w=100
+    printf '\n%sWhat to do next:%s\n' "$BOLD" "$NC"
+    # Long lines are wrapped at word boundaries to fit a phone screen.
+    for l in "$@"; do fold -s -w "$((w - 5))" <<<"$l" | sed -e 's/ *$//' -e '1s/^/  - /' -e '2,$s/^/    /'; done
+}
+# choose VAR "Title" item... -> VAR=1..N (0 = Back, or Exit in the main menu)
+#   "Label"          a plain item
+#   "Label|hint"     the hint is printed dim after the label (or below it)
+#   "~Label|reason"  shown, but not selectable on this server (reason says why)
+#   "#Heading"       a group heading, not numbered
+choose() {
+    local __ch_var="$1" __ch_title="$2" __ch_n=0 __ch_item __ch_ans="" __ch_zero=Back
+    local __ch_lab __ch_hint __ch_w=0 __ch_cols __ch_nw=1 __ch_first=1 __ch_line
+    local -a __ch_off=("")
     shift 2
     if [[ "$__ch_title" == "Main menu" ]]; then __ch_zero=Exit; fi
-    printf '\n%s%s%s\n' "$BOLD" "$__ch_title" "$NC"
+    __ch_cols=$(term_cols)
     for __ch_item in "$@"; do
-        printf '  %s%2d)%s %s\n' "$GREEN" "$__ch_n" "$NC" "$__ch_item"
+        [[ "$__ch_item" == \#* ]] && continue
         __ch_n=$((__ch_n + 1))
+        [[ "$__ch_item" == *"|"* ]] || continue
+        __ch_lab="${__ch_item#\~}" __ch_lab="${__ch_lab%%|*}"
+        (( ${#__ch_lab} > __ch_w )) && __ch_w=${#__ch_lab}
     done
-    printf '  %s 0)%s %s\n' "$GREEN" "$NC" "$__ch_zero"
+    (( __ch_n >= 10 )) && __ch_nw=2
+    (( __ch_w > 32 )) && __ch_w=32
+    printf '\n%s%s%s\n' "$BOLD" "$__ch_title" "$NC"
+    __ch_n=0
+    for __ch_item in "$@"; do
+        if [[ "$__ch_item" == \#* ]]; then
+            (( __ch_first )) || printf '\n'
+            printf ' %s%s:%s\n' "$DIM" "${__ch_item#\#}" "$NC"
+            __ch_first=0
+            continue
+        fi
+        __ch_first=0 __ch_n=$((__ch_n + 1))
+        __ch_lab="${__ch_item#\~}" __ch_hint=""
+        if [[ "$__ch_lab" == *"|"* ]]; then __ch_hint="${__ch_lab#*|}" __ch_lab="${__ch_lab%%|*}"; fi
+        if [[ "$__ch_item" == \~* ]]; then
+            __ch_off+=("${__ch_hint:-not available here}")
+            __ch_hint="(${__ch_hint:-not available here})"
+            printf -v __ch_line '  %s%*d) %s' "$DIM" "$__ch_nw" "$__ch_n" "$__ch_lab"
+        else
+            __ch_off+=("")
+            printf -v __ch_line '  %s%*d)%s %s' "$GREEN" "$__ch_nw" "$__ch_n" "$NC" "$__ch_lab"
+        fi
+        if [[ -z "$__ch_hint" ]]; then
+            printf '%s%s\n' "$__ch_line" "$NC"
+        elif (( __ch_nw + __ch_w + ${#__ch_hint} + 6 <= __ch_cols && ${#__ch_lab} <= __ch_w )); then
+            printf '%s%*s  %s%s%s\n' "$__ch_line" "$((__ch_w - ${#__ch_lab}))" '' "$DIM" "$__ch_hint" "$NC"
+        else
+            printf '%s%s\n%*s%s%s%s\n' "$__ch_line" "$NC" "$((__ch_nw + 5))" '' "$DIM" "$__ch_hint" "$NC"
+        fi
+    done
+    printf '  %s%*d)%s %s\n' "$GREEN" "$__ch_nw" 0 "$NC" "$__ch_zero"
     while :; do
         ask __ch_ans "Choose" "0"
-        if [[ "$__ch_ans" =~ ^[0-9]{1,3}$ ]] && (( 10#$__ch_ans < __ch_n )); then
+        if [[ "$__ch_ans" =~ ^[0-9]{1,3}$ ]] && (( 10#$__ch_ans <= __ch_n )); then
+            if [[ -n "${__ch_off[10#$__ch_ans]}" ]]; then
+                warn "Not available: ${__ch_off[10#$__ch_ans]}."
+                continue
+            fi
             printf -v "$__ch_var" '%s' "$((10#$__ch_ans))"
             return 0
         fi
-        warn "Type a number from 0 to $((__ch_n - 1))."
+        warn "Type a number from 0 to $__ch_n."
     done
 }
 
@@ -942,7 +1022,9 @@ tunnel_status() {  # tunnel_status [NAME]
     local -a names=()
     if [[ -n "${1:-}" ]]; then names=("$1"); else mapfile -t names < <(tun_list); fi
     if (( ${#names[@]} == 0 )); then info "No tunnels yet."; return 0; fi
-    printf '%s%-10s %-7s %-8s %-4s %-30s %-16s %-16s %s%s\n' "$BOLD" NAME ROLE STATE FAM "LOCAL -> REMOTE" "PING v4" "PING v6" "RX / TX" "$NC"
+    local short=0
+    if narrow 140; then short=1; fi
+    (( short )) || printf '%s%-10s %-7s %-8s %-4s %-30s %-16s %-16s %s%s\n' "$BOLD" NAME ROLE STATE FAM "LOCAL -> REMOTE" "PING v4" "PING v6" "RX / TX" "$NC"
     for n in "${names[@]}"; do
         tun_load "$n" || { warn "Unknown tunnel: $n"; continue; }
         st="${RED}missing${NC}" v4="-" v6="-" rx=0 tx=0
@@ -955,8 +1037,19 @@ tunnel_status() {  # tunnel_status [NAME]
             fi
             read -r rx tx <<<"$(iface_bytes "$n")"
         fi
-        printf '%-10s %-7s %-19s %-4s %-30s %-27s %-27s %s / %s\n' "$n" "${C[ROLE]}" "$st" "v${C[FAMILY]}" \
-            "${C[LOCAL]} -> ${C[REMOTE]}" "$v4" "$v6" "$(fmt_bytes "$rx")" "$(fmt_bytes "$tx")"
+        if (( short )); then
+            # The same facts as the table, as a block that fits a phone screen.
+            (( short++ > 1 )) && printf '\n'
+            printf '%s%s%s  %s side  %s  IPv%s transport\n' "$BOLD" "$n" "$NC" "${C[ROLE]}" "$st" "${C[FAMILY]}"
+            printf '  %-8s%s -> %s\n' public "${C[LOCAL]}" "${C[REMOTE]}"
+            printf '  %-8sv4 %s   v6 %s\n' ping "$v4" "$v6"
+            printf '  %-8s%s <-> %s\n' inner "${C[IN4_LOCAL]}" "${C[IN4_PEER]}"
+            if [[ -n "${C[IN6_LOCAL]:-}" ]]; then printf '  %-8s%s <-> %s\n' "" "${C[IN6_LOCAL]}" "${C[IN6_PEER]:--}"; fi
+            printf '  %-8s%s   rx %s / tx %s\n' mtu "${C[MTU]}" "$(fmt_bytes "$rx")" "$(fmt_bytes "$tx")"
+            continue
+        fi
+        printf '%-10s %-7s %s %-4s %-30s %s %s %s / %s\n' "$n" "${C[ROLE]}" "$(cpad "$st" 8)" "v${C[FAMILY]}" \
+            "${C[LOCAL]} -> ${C[REMOTE]}" "$(cpad "$v4" 16)" "$(cpad "$v6" 16)" "$(fmt_bytes "$rx")" "$(fmt_bytes "$tx")"
         printf '           inner %s <-> %s   %s <-> %s   mtu %s\n' "${C[IN4_LOCAL]}" "${C[IN4_PEER]}" \
             "${C[IN6_LOCAL]:--}" "${C[IN6_PEER]:--}" "${C[MTU]}"
     done
@@ -1451,19 +1544,20 @@ print_key() {  # print_key NAME
     # key_for ran in a subshell: load the tunnel here for the details below.
     tun_load "$1" || die "Unknown tunnel $1."
     section "Connection key for the Iran server"
-    printf 'Key (menu on the Iran server: 1) GRE tunnel -> 2) paste a connection key):\n\n'
     printf '%s%s%s\n\n' "$GREEN$BOLD" "$key" "$NC"
-    printf 'Or paste this whole line on the Iran server:\n\n'
+    printf 'On the Iran server, either:\n'
+    printf '  a) menu: gretun > 1) GRE tunnel > 2) Iran: paste the key\n'
+    printf '  b) or paste this whole line:\n\n'
     printf "%sgretun tunnel add --key '%s'%s\n\n" "$GREEN$BOLD" "$key" "$NC"
     cat <<EOF
-Manual values instead of the key:
+Manual values (only for "Iran: manual setup"):
   Transport:       IPv${C[FAMILY]}
   Iran address:    ${C[REMOTE]}
   Foreign address: ${C[LOCAL]}
   Tunnel network:  $(cidr_norm "${C[IN4_LOCAL]}/${C[IN4_PREFIX]}")
   MTU:             ${C[MTU]}
-
-Inner addresses: Iran ${C[IN4_PEER]} / ${C[IN6_PEER]}  <->  this server ${C[IN4_LOCAL]} / ${C[IN6_LOCAL]}
+  Inner, Iran:     ${C[IN4_PEER]}  ${C[IN6_PEER]}
+  Inner, foreign:  ${C[IN4_LOCAL]}  ${C[IN6_LOCAL]}
 EOF
 }
 ask_family() {
@@ -1475,8 +1569,12 @@ ask_family() {
     fi
     if [[ -n "$(detect_local 6)" ]]; then d=6; fi
     local a
+    if (( HAVE_TTY && ! ASSUME_YES )); then
+        # ask_family runs inside $(...): the explanation goes to the terminal.
+        printf '\nTransport between the two servers (both must have it):\n  6 = IPv6 (ip6gre, MTU 1450)\n  4 = IPv4 (gre, MTU 1476)\n' >/dev/tty
+    fi
     while :; do
-        ask a "Transport between the servers: 6 = IPv6 (ip6gre, MTU 1450), 4 = IPv4 (gre, MTU 1476)" "$d"
+        ask a "Transport, 4 or 6" "$d"
         [[ "$a" == 4 || "$a" == 6 ]] && { printf '%s' "$a"; return 0; }
         warn "Type 4 or 6."
     done
@@ -1527,11 +1625,12 @@ cmd_tunnel_add() {
     if [[ -n "$O_KEY" ]]; then tunnel_add_iran_key "$O_KEY"; return; fi
     local role="$O_ROLE" r
     if [[ -z "$role" ]]; then
-        choose r "Which server is this?" "Foreign (exit) server: create the tunnel and print a connection key" \
-            "Iran (entry) server: paste the connection key" "Iran (entry) server: enter the values manually"
+        choose r "Which server is this?" "Foreign (exit) server: new tunnel|prints a key for the Iran server" \
+            "Iran (entry) server: paste the key|connects and tests the tunnel" \
+            "Iran (entry) server: manual setup|no key: type the values instead"
         case "$r" in
             1) role=foreign ;;
-            2) local k; ask k "Paste the connection key"; tunnel_add_iran_key "$k"; return ;;
+            2) local k; ask_conn_key k || return 0; tunnel_add_iran_key "$k"; return ;;
             3) role=iran ;;
             *) return 0 ;;
         esac
@@ -1544,19 +1643,51 @@ cmd_tunnel_add() {
 }
 tunnel_add_foreign() {
     local fam local_ peer net
-    fam=$(ask_family)
+    fam=$(ask_family) || exit 1
     C=()
     ask_addr local_ "$fam" "This (foreign) server's public IPv$fam" "${O_LOCAL:-$(detect_local "$fam")}"
     local_has_addr "$local_" || warn "$local_ is not configured on this server (fine only behind 1:1 NAT)."
-    ask_addr peer "$fam" "The Iran server's public IPv$fam" "$O_PEER"
+    while :; do
+        ask_addr peer "$fam" "The Iran server's public IPv$fam" "$O_PEER"
+        local used_by
+        used_by=$(tunnel_to "$peer")
+        # create_tunnel refuses it too; in the menu the address is asked again.
+        [[ -n "$used_by" && -z "$O_PEER" ]] && (( HAVE_TTY && ! ASSUME_YES )) || break
+        warn "Tunnel $used_by already goes to $peer. Type another address (or use/remove $used_by)."
+    done
     C=([NAME]="${O_NAME:-$(next_tun_name)}" [FAMILY]="$fam" [ROLE]=foreign [LOCAL]="$local_" [REMOTE]="$peer" [ORIGIN]=gretun)
     valid_name "${C[NAME]}" || die "Invalid tunnel name: ${C[NAME]}"
-    C[MTU]=$(ask_mtu "$fam")
-    net=$(alloc_net4)
+    C[MTU]=$(ask_mtu "$fam") || exit 1
+    net=$(alloc_net4) || exit 1
     fill_inner foreign "$net"
     local name="${C[NAME]}"
+    tunnel_summary || return 0
     create_tunnel || return 1
     print_key "$name"
+    next_steps "Copy the key above and paste it on the Iran server." \
+        "Then, on the Iran server: 2) Port forwarding or 3) PasarGuard node."
+}
+tunnel_to() {  # tunnel_to ADDR: the tunnel that already goes to this public address
+    local f
+    for f in $(tun_list); do
+        if same_ip "$(conf_val "$TUN_DIR/$f.conf" REMOTE)" "$1"; then printf '%s' "$f"; return 0; fi
+    done
+}
+# tunnel_summary: in the menu, shows the tunnel in C and asks before creating it.
+tunnel_summary() {
+    (( IN_MENU )) || return 0
+    local other=Iran this=foreign
+    if [[ "${C[ROLE]}" == iran ]]; then other=Foreign this=Iran; fi
+    section "New tunnel ${C[NAME]} (this is the $this server)"
+    cat <<EOF
+  Transport:       IPv${C[FAMILY]} ($( [[ ${C[FAMILY]} == 6 ]] && echo ip6gre || echo gre ))
+  This server:     ${C[LOCAL]}
+  $(printf '%-17s' "$other server:")${C[REMOTE]}
+  Tunnel network:  $(cidr_norm "${C[IN4_LOCAL]}/${C[IN4_PREFIX]}")
+  Inner addresses: here ${C[IN4_LOCAL]}, other side ${C[IN4_PEER]}
+  MTU:             ${C[MTU]}
+EOF
+    confirm "Create the tunnel?" Y || { info "Nothing was created."; return 1; }
 }
 tunnel_add_iran_key() {
     key_decode "$1" || die "This connection key is not valid (copy it again, completely)."
@@ -1570,22 +1701,26 @@ tunnel_add_iran_key() {
 }
 tunnel_add_iran_manual() {
     local fam local_ peer net
-    fam=$(ask_family)
+    fam=$(ask_family) || exit 1
     ask_addr local_ "$fam" "This (Iran) server's public IPv$fam" "${O_LOCAL:-$(detect_local "$fam")}"
     ask_addr peer "$fam" "The foreign server's public IPv$fam" "$O_PEER"
+    if (( HAVE_TTY && ! ASSUME_YES )) && [[ -z "$O_INNER_NET" ]]; then
+        printf '%sThe foreign server shows it as "Tunnel network", e.g. 10.45.12.0/30.%s\n' "$DIM" "$NC"
+    fi
     while :; do
-        ask net "Tunnel network shown on the foreign server (e.g. 10.45.12.0/30)" "$O_INNER_NET"
+        ask net "Tunnel network" "$O_INNER_NET"
         net=$(norm_tun_net "$net") && break
         (( ASSUME_YES || ! HAVE_TTY )) && die "Invalid tunnel network (use --inner-net 10.X.Y.0/30)."
         warn "Use the form 10.X.Y.0/30."
     done
     C=([NAME]="${O_NAME:-$(next_tun_name)}" [FAMILY]="$fam" [ROLE]=iran [LOCAL]="$local_" [REMOTE]="$peer" [ORIGIN]=gretun)
-    C[MTU]=$(ask_mtu "$fam")
+    C[MTU]=$(ask_mtu "$fam") || exit 1
     fill_inner iran "$net"
     tunnel_add_iran_finish
 }
 tunnel_add_iran_finish() {
     local n="${C[NAME]}" peer4="${C[IN4_PEER]}" peer6="${C[IN6_PEER]}" i
+    tunnel_summary || return 0
     create_tunnel || return 1
     (( DRY )) && return 0
     info "Testing the tunnel (ping ${peer4})..."
@@ -1595,6 +1730,8 @@ tunnel_add_iran_finish() {
             if ping_peer "$peer6" 3; then ok "IPv6 inside the tunnel works: ${PING_RTT} ms."
             else warn "IPv6 inside the tunnel does not answer yet (the foreign side may run an old version)."; fi
             tunnel_status "$n"
+            next_steps "To forward ports: gretun > 2) Port forwarding > 1) Add ports" \
+                "For PasarGuard: gretun > 3) PasarGuard node > 1) Iran: set up the node"
             return 0
         fi
         : "$i"
@@ -1616,16 +1753,19 @@ tunnel_used_by() {  # prints what depends on tunnel NAME
     C=()
 }
 pick_tunnel() {  # pick_tunnel VAR [role]
-    local __names=() __n __c
+    local __names=() __labels=() __n __c
     for __n in $(tun_list); do
         tun_load "$__n" || continue
-        [[ -z "${2:-}" || "${C[ROLE]}" == "$2" ]] && __names+=("$__n")
+        if [[ -z "${2:-}" || "${C[ROLE]}" == "$2" ]]; then
+            __names+=("$__n")
+            __labels+=("$__n|${C[ROLE]} side, to ${C[REMOTE]}")
+        fi
     done
     C=()
-    (( ${#__names[@]} )) || die "No ${2:+$2-side }tunnel exists yet. Create one in section 1."
+    (( ${#__names[@]} )) || die "No ${2:+$2-side }tunnel exists yet. Create one first: gretun > 1) GRE tunnel"
     if [[ -n "$O_TUNNEL" ]]; then printf -v "$1" '%s' "$O_TUNNEL"; return 0; fi
     if (( ${#__names[@]} == 1 )); then printf -v "$1" '%s' "${__names[0]}"; return 0; fi
-    choose __c "Which tunnel?" "${__names[@]}"
+    choose __c "Which tunnel?" "${__labels[@]}"
     (( __c > 0 )) || exit 0
     printf -v "$1" '%s' "${__names[__c - 1]}"
 }
@@ -1668,17 +1808,8 @@ cmd_tunnel_forward() {
     fi
     [[ "$(conf_val "$TUN_DIR/$n.conf" ROLE)" == iran ]] || die "Tunnel $n is not an Iran-side tunnel."
     O_DEST=$(conf_val "$TUN_DIR/$n.conf" IN4_PEER)
-    printf '
-Ports of this server are forwarded through %s to the foreign server (%s).
-' "$n" "$O_DEST"
+    printf '\nForwarding through %s to the foreign server %s.\n' "$n" "$O_DEST"
     cmd_fwd_add
-    printf '
-On the foreign server the service must listen on that port (0.0.0.0 or %s).
-' "$O_DEST"
-    printf 'If ufw is active there:  ufw allow in on <its tunnel, e.g. gre1>
-'
-    printf 'Check here with:         gretun fwd status
-'
 }
 addr_arg() {  # addr_arg FAMILY VALUE FLAG: prints the checked address
     if [[ "$1" == 4 ]] && is_ipv4 "$2"; then printf '%s' "$2"; return 0; fi
@@ -2428,9 +2559,9 @@ ask_dest() {  # ask_dest VAR: the foreign inner IP of an Iran-side tunnel
     for __n in $(tun_list); do
         [[ "$(conf_val "$TUN_DIR/$__n.conf" ROLE)" == iran ]] || continue
         __ips+=("$(conf_val "$TUN_DIR/$__n.conf" IN4_PEER)")
-        __list+=("${__ips[-1]} (the foreign server, through tunnel $__n)")
+        __list+=("$__n|to ${__ips[-1]} (foreign server $(conf_val "$TUN_DIR/$__n.conf" REMOTE))")
     done
-    (( ${#__ips[@]} )) || die "Port forwarding goes through a tunnel: create one first (menu 1, on the Iran server)."
+    (( ${#__ips[@]} )) || die "Port forwarding goes through a tunnel: create one first (gretun > 1) GRE tunnel, on the Iran server)."
     if [[ -n "$O_DEST" ]]; then
         __d="${O_DEST#[}" __d="${__d%]}"
         is_ipv6 "$__d" && die "Forwarding straight to an IPv6 address (without a tunnel) was removed. Use: gretun tunnel forward --ports ..."
@@ -2445,12 +2576,19 @@ ask_dest() {  # ask_dest VAR: the foreign inner IP of an Iran-side tunnel
     fi
     printf -v "$1" '%s' "$__d"
 }
+tunnel_of_peer() {  # tunnel_of_peer INNER_IP: the Iran-side tunnel whose foreign end it is
+    local n
+    for n in $(tun_list); do
+        if [[ "$(conf_val "$TUN_DIR/$n.conf" IN4_PEER)" == "$1" ]]; then printf '%s' "$n"; return 0; fi
+    done
+    printf '?'
+}
 ask_proto() {  # ask_proto VAR
     local __p="$O_PROTO" __c
     if [[ -z "$__p" ]]; then
         if (( ASSUME_YES || ! HAVE_TTY )); then __p=tcp
         else
-            choose __c "Protocol" "TCP (most services: VLESS/VMess/Trojan over TCP/WS/gRPC)" "UDP (Hysteria, TUIC, WireGuard)" "TCP + UDP"
+            choose __c "Protocol" "TCP|most services: VLESS, VMess, Trojan" "UDP|Hysteria, TUIC, WireGuard" "TCP + UDP|both"
             case "$__c" in 1) __p=tcp ;; 2) __p=udp ;; 3) __p=both ;; *) exit 0 ;; esac
         fi
     fi
@@ -2465,18 +2603,33 @@ cmd_fwd_add() {
     need_base
     local dest ports proto opts pairs l d own i
     ask_dest dest
-    if [[ -n "$O_PORTS" ]]; then ports="$O_PORTS"
+    if [[ -n "$O_PORTS" ]]; then
+        ports="$O_PORTS"
+        pairs=$(parse_ports "$ports") || die "Invalid port list."
     else
-        printf '  Ports: %s443,8443%s (same port) or %s4040=443%s (listen 4040, forward to 443)\n' "$BOLD" "$NC" "$BOLD" "$NC"
-        ask ports "Ports"
+        (( HAVE_TTY && ! ASSUME_YES )) || die "Which ports? Pass --ports, e.g. --ports 443,8443 or --ports 4040=443"
+        printf '\nPorts to forward, for example:\n'
+        printf '  %s443,8443%s   the same port on both servers\n' "$BOLD" "$NC"
+        printf '  %s4040=443%s   port 4040 here -> port 443 there\n' "$BOLD" "$NC"
+        while :; do
+            ask ports "Ports (Enter = cancel)"
+            if [[ -z "$ports" ]]; then info "Nothing changed."; return 0; fi
+            if pairs=$(parse_ports "$ports") && [[ -n "$pairs" ]]; then break; fi
+            (( HAVE_TTY && ! ASSUME_YES )) || die "Invalid port list."
+            warn "Ports are 1-65535, e.g. 443,8443 or 4040=443."
+        done
     fi
-    pairs=$(parse_ports "$ports") || die "Invalid port list."
     ask_proto proto
     opts="$proto"
     if (( O_PROXY )) || { (( ! ASSUME_YES && HAVE_TTY )) && has_opt "$opts" tcp \
-        && confirm "Send PROXY protocol v2 (the destination must expect it)?" N; }; then opts+=",proxy"; fi
+        && confirm "PROXY protocol v2 (only if the service expects it)?" N; }; then opts+=",proxy"; fi
     if (( O_CHECK )) || { (( ! ASSUME_YES && HAVE_TTY )) && has_opt "$opts" tcp \
         && confirm "Enable TCP health checks?" N; }; then opts+=",check"; fi
+    if (( IN_MENU )); then
+        section "Forward through tunnel $(tunnel_of_peer "$dest") to the foreign server"
+        while read -r l d; do printf '  port %-6s -> %s  (%s)\n' "$l" "$(host_port "$dest" "$d")" "${opts//,/, }"; done <<<"$pairs"
+        confirm "Apply?" Y || { info "Nothing changed."; return 0; }
+    fi
     fwd_load
     while read -r l d; do
         i=$(fwd_find "$l") && [[ "${F_IP[i]}" != "$dest" || "${F_DPORT[i]}" != "$d" ]] \
@@ -2496,6 +2649,9 @@ cmd_fwd_add() {
         ok "Forwarding active:"
         while read -r l d; do printf '       :%s -> %s  (%s)\n' "$l" "$(host_port "$dest" "$d")" "$opts"; done <<<"$pairs"
         ufw_ports allow "$pairs" "$opts"
+        next_steps "On the foreign server the service must listen on port(s) $(awk '{print $2}' <<<"$pairs" | sort -nu | paste -sd, -) (on 0.0.0.0 or $dest)." \
+            "If ufw is active there: ufw allow in on <its tunnel, e.g. gre1>" \
+            "Check here: 2) Port forwarding > 4) Status  (CLI: gretun fwd status)"
     else
         die "Could not apply the rules; the previous configuration is back."
     fi
@@ -2515,13 +2671,14 @@ ufw_ports() {  # ufw_ports allow|delete PAIRS OPTS
 cmd_fwd_list() {
     fwd_load
     if (( ${#F_LISTEN[@]} == 0 )); then info "No forwarding rules."; return 0; fi
-    local i
-    printf '%s%-8s %-9s %-46s %s%s\n' "$BOLD" PORT PROTO DESTINATION OPTIONS "$NC"
+    local i dw=46
+    if narrow 80; then dw=22; fi
+    printf '%s%-8s %-9s %-*s %s%s\n' "$BOLD" PORT PROTO "$dw" DESTINATION OPTIONS "$NC"
     for i in $(fwd_sorted); do
         local p="${F_OPTS[i]}" extra
         extra=$(tr ',' '\n' <<<"$p" | grep -vxE 'tcp|udp' | paste -sd, - || true)
         p=$(tr ',' '\n' <<<"$p" | grep -xE 'tcp|udp' | paste -sd+ - || true)
-        printf '%-8s %-9s %-46s %s\n' "${F_LISTEN[i]}" "$p" "$(host_port "${F_IP[i]}" "${F_DPORT[i]}")" "${extra:--}"
+        printf '%-8s %-9s %-*s %s\n' "${F_LISTEN[i]}" "$p" "$dw" "$(host_port "${F_IP[i]}" "${F_DPORT[i]}")" "${extra:--}"
     done
 }
 cmd_fwd_remove() {
@@ -2530,12 +2687,22 @@ cmd_fwd_remove() {
     (( ${#F_LISTEN[@]} )) || die "There are no rules."
     if (( ${#list[@]} == 0 )); then
         cmd_fwd_list
-        local a
-        ask a "Ports to remove (e.g. 443,8443)"
-        mapfile -t list < <(split_list "$a")
+        local a bad
+        while :; do
+            printf '\n'
+            ask a "Ports to remove, e.g. 443,8443 (Enter = cancel)"
+            [[ -n "$a" ]] || { info "Nothing removed."; return 0; }
+            mapfile -t list < <(split_list "$a")
+            bad=""
+            for p in "${list[@]}"; do valid_port "$p" || bad+=" $p"; done
+            [[ -n "$bad" ]] || break
+            (( HAVE_TTY && ! ASSUME_YES )) || die "Invalid port(s):$bad"
+            warn "Not a port number:$bad"
+        done
     fi
     local removed=""
     for p in "${list[@]}"; do
+        valid_port "$p" || { warn "Not a port number: $p"; continue; }
         i=$(fwd_find "$((10#$p))") || { warn "No rule on port $p."; continue; }
         ufw_ports delete "${F_LISTEN[i]} ${F_DPORT[i]}" "${F_OPTS[i]}"
         fwd_del "$((10#$p))"
@@ -2560,7 +2727,10 @@ cmd_fwd_status() {
     fi
     (( ${#F_LISTEN[@]} )) || { info "No forwarding rules."; return 0; }
     while read -r p b_in; do cnt[$p]="$b_in"; done < <(read_counters)
-    printf '\n%s%-7s %-5s %-44s %-7s %-6s %-11s %-11s %s%s\n' "$BOLD" PORT PROTO DESTINATION LISTEN CONNS IN OUT DEST "$NC"
+    local short=0
+    if narrow 120; then short=1; fi
+    if (( short )); then printf '\n'
+    else printf '\n%s%-7s %-5s %-44s %-7s %-6s %-11s %-11s %s%s\n' "$BOLD" PORT PROTO DESTINATION LISTEN CONNS IN OUT DEST "$NC"; fi
     for i in $(fwd_sorted); do
         p="${F_LISTEN[i]}"
         for proto in tcp udp; do
@@ -2576,8 +2746,14 @@ cmd_fwd_status() {
             fi
             b_in="${cnt[${proto:0:1}${p}i]:-0}" b_out="${cnt[${proto:0:1}${p}o]:-0}"
             tot_in=$((tot_in + b_in)) tot_out=$((tot_out + b_out))
-            printf '%-7s %-5s %-44s %-18s %-6s %-11s %-11s %s\n' "$p" "$proto" \
-                "$(host_port "${F_IP[i]}" "${F_DPORT[i]}")" "$st" "$conns" "$(fmt_bytes "$b_in")" "$(fmt_bytes "$b_out")" "$reach"
+            if (( short )); then
+                printf '%s%s/%s%s -> %s   listening %s   dest %s\n' "$BOLD" "$p" "$proto" "$NC" \
+                    "$(host_port "${F_IP[i]}" "${F_DPORT[i]}")" "$st" "$reach"
+                printf '  connections %s   in %s   out %s\n' "$conns" "$(fmt_bytes "$b_in")" "$(fmt_bytes "$b_out")"
+                continue
+            fi
+            printf '%-7s %-5s %-44s %s %-6s %-11s %-11s %s\n' "$p" "$proto" \
+                "$(host_port "${F_IP[i]}" "${F_DPORT[i]}")" "$(cpad "$st" 7)" "$conns" "$(fmt_bytes "$b_in")" "$(fmt_bytes "$b_out")" "$reach"
         done
     done
     printf '\nTotal since the counters were created: in %s, out %s\n' "$(fmt_bytes "$tot_in")" "$(fmt_bytes "$tot_out")"
@@ -2912,7 +3088,8 @@ table_free() {  # no routes in it and no ip rule points to it
 want_advanced() {
     (( HAVE_TTY && ! ASSUME_YES )) || return 1
     printf '\nAdvanced settings: %s\n' "$1"
-    confirm "Change the advanced settings? (the automatic values are fine for almost everyone)" N
+    printf '%sThe automatic values are fine for almost everyone.%s\n' "$DIM" "$NC"
+    confirm "Change them?" N
 }
 ask_wan() {  # ask_wan VAR 4|6
     local __a __d
@@ -2997,7 +3174,7 @@ pg_pick_wg() {
             printf -v "$1" '%s' "${__pw_list[0]}" ;;
         *)
             (( HAVE_TTY && ! ASSUME_YES )) || die "Several WireGuard interfaces (${__pw_list[*]}): choose one with --wg-if."
-            for __pw_w in "${__pw_list[@]}"; do __pw_opts+=("$__pw_w  ($(wg_nets "$__pw_w" 4) $(wg_nets "$__pw_w" 6))"); done
+            for __pw_w in "${__pw_list[@]}"; do __pw_opts+=("$__pw_w|$(wg_nets "$__pw_w" 4) $(wg_nets "$__pw_w" 6)"); done
             choose __pw_c "Which WireGuard interface belongs to this node?" "${__pw_opts[@]}"
             (( __pw_c > 0 )) || exit 0
             printf -v "$1" '%s' "${__pw_list[__pw_c - 1]}" ;;
@@ -3030,7 +3207,7 @@ cmd_pg_setup() {
             [[ -n "$line" ]] || die "Node $O_NODE not found. Found: $(cut -d'|' -f1 <<<"$nodes" | paste -sd' ' -)"
         else
             local -a opts=()
-            while IFS='|' read -r name dir cli cont; do opts+=("$name  ($dir${cont:+, container $cont})"); done <<<"$nodes"
+            while IFS='|' read -r name dir cli cont; do opts+=("$name|$dir${cont:+, container $cont}"); done <<<"$nodes"
             if (( ${#opts[@]} == 1 && (ASSUME_YES || ! HAVE_TTY) )); then c=1
             else choose c "Which PasarGuard node?" "${opts[@]}"; (( c > 0 )) || return 0; fi
             line=$(sed -n "${c}p" <<<"$nodes")
@@ -3051,11 +3228,14 @@ cmd_pg_setup() {
     d4=$(wg_nets "$wg" 4) d6=$(wg_nets "$wg" 6)
     [[ -n "$d4" ]] || d4=$(conf_val "${old:-/dev/null}" V4_SUBNETS)
     [[ -n "$d6" ]] || d6=$(conf_val "${old:-/dev/null}" V6_SUBNETS)
-    printf '\nWireGuard client subnets: exactly what the panel core uses in its Address field.\n'
+    printf '\nClient subnets: the Address field of the WireGuard core in the panel.\n'
     if [[ -n "$d4$d6" ]] && iface_exists "$wg"; then printf '(%s has: %s)\n' "$wg" "$d4 $d6"; fi
-    ask_subnets v4 4 "$O_V4" "Client IPv4 subnet(s), e.g. 10.0.0.0/16" "$d4"
+    local e4=", e.g. 10.0.0.0/16" e6=", e.g. fd10:10::/64"   # the example only when there is no default
+    if [[ -n "$d4" ]]; then e4=""; fi
+    if [[ -n "$d6" ]]; then e6=""; fi
+    ask_subnets v4 4 "$O_V4" "Client IPv4 subnet(s)$e4" "$d4"
     if [[ -z "$O_V6" && -n "$O_V4" ]] && (( ASSUME_YES || ! HAVE_TTY )); then v6="$d6"
-    else ask_subnets v6 6 "$O_V6" "Client IPv6 subnet(s), e.g. fd10:10::/64 (or 'none')" "$d6" optional; fi
+    else ask_subnets v6 6 "$O_V6" "Client IPv6 subnet(s) or 'none'$e6" "$d6" optional; fi
     local x net4 net6
     net4=$(cidr_norm "$(conf_val "$TUN_DIR/$tun.conf" IN4_LOCAL)/$(conf_val "$TUN_DIR/$tun.conf" IN4_PREFIX 30)")
     net6=$(cidr_norm "$(conf_val "$TUN_DIR/$tun.conf" IN6_LOCAL)/64")
@@ -3088,22 +3268,28 @@ cmd_pg_setup() {
 
     section "PasarGuard node $name via $tun"
     cat <<EOF
-  node .env:      $env
-  tunnel:         $tun (inner ${C[IN4_LOCAL]} / ${C[IN6_LOCAL]})
-  client subnets: ${v4} ${v6:-}
-  routing table:  $tbl   WireGuard interface: $wg
-  .env values:    PG_NODE_WG_HOST_ROUTING=1  PG_NODE_WG_NAT_OUTPUT_INTERFACE=$tun
-                  PG_NODE_WG_NAT_EGRESS_ONLY=0  PG_NODE_WG_NAT_DISABLE=0
-                  PG_NODE_WG_ROUTE_TABLE=$tbl  PG_NODE_WG_ROUTE_OUT_INTERFACE=$tun
+  Node .env:      $env
+  Tunnel:         $tun, inner ${C[IN4_LOCAL]}  ${C[IN6_LOCAL]}
+  Client subnets: ${v4} ${v6:-}
+  Routing table:  $tbl
+  WireGuard:      $wg
+  .env values:    PG_NODE_WG_HOST_ROUTING=1
+                  PG_NODE_WG_NAT_OUTPUT_INTERFACE=$tun
+                  PG_NODE_WG_NAT_EGRESS_ONLY=0
+                  PG_NODE_WG_NAT_DISABLE=0
+                  PG_NODE_WG_ROUTE_TABLE=$tbl
+                  PG_NODE_WG_ROUTE_OUT_INTERFACE=$tun
 EOF
     local def=Y line
     if ! iface_exists "$wg" && [[ -n "$(wg_ifaces)" ]]; then
         warn "$wg does not exist, but these WireGuard interfaces do: $(wg_ifaces | paste -sd' ' -)"
-        hint "With the wrong interface IPv6 does not work. Use the core's interface_name (--wg-if, or the advanced settings)."
+        hint "With the wrong interface IPv6 does not work."
+        hint "Use the core's interface_name (--wg-if, or the advanced settings)."
         def=N
     fi
     while read -r line; do [[ -n "$line" ]] && warn "$line"; done < <(wg_mismatch "$wg" "$v4" "$v6")
-    confirm "Apply (the node restarts; clients reconnect within seconds)?" "$def" || return 0
+    printf '%sThe node restarts; its clients reconnect within seconds.%s\n' "$DIM" "$NC"
+    confirm "Apply?" "$def" || { info "Nothing changed."; return 0; }
 
     rb_begin "PasarGuard $name via $tun"
     rb_save_file "$env"
@@ -3138,20 +3324,23 @@ EOF
     pg_verify "$name" || true
     section "Exit key for the foreign server"
     printf '%s%s%s\n' "$GREEN$BOLD" "$(exit_key "$tun" "$v4" "$v6")" "$NC"
-    printf 'On the foreign server run:  gretun exit add --key <the key above>\n'
-    printf '(menu: 3) PasarGuard -> 2) Foreign server: add the exit)\n'
+    next_steps "On the foreign server: gretun > 3) PasarGuard node > 2) Foreign: add the exit, and paste the key above (CLI there: gretun exit add --key KEY)." \
+        "Set the panel as shown below; clients download their config again." \
+        "Test a client after that, then keep the change (yes, or: gretun confirm)."
     pg_panel_help "$v4" "$v6"
     rb_arm 600
 }
 pg_panel_help() {  # pg_panel_help V4 V6
     section "Still to do in the PasarGuard panel"
     cat <<EOF
-  1. Core config -> WireGuard -> Address: ${1// /, }${2:+, ${2// /, }}
+  1. Core config -> WireGuard -> Address:
+       ${1// /, }${2:+, ${2// /, }}
      (both subnets, otherwise clients get no IPv6)
   2. Hosts -> the WireGuard host -> MTU: 1420
-     (field test Iran <-> DE: MTU 1280 gave ~1 Mbps upload, 1420 gave ~120 Mbps)
+     (field test Iran <-> DE: MTU 1280 gave ~1 Mbps
+     upload, 1420 gave ~120 Mbps)
   3. AllowedIPs for clients: 0.0.0.0/0, ::/0
-  Clients must download their config again after these changes.
+  Clients download their config again after this.
 EOF
 }
 # ---------------------------------------------------------------- Iran: verify
@@ -3357,15 +3546,28 @@ cmd_exit_add() {
     need_base
     local key="$O_KEY" tun="" v4 v6 n c
     if [[ -z "$key" && -z "$O_V4" ]]; then
-        choose c "Exit for a PasarGuard node" "Paste the exit key printed on the Iran server" "Enter the subnets manually"
-        case "$c" in 1) ask key "Exit key" ;; 2) ;; *) return 0 ;; esac
+        choose c "Exit for a PasarGuard node" "Paste the exit key|from the Iran node setup" \
+            "Enter the subnets manually|no key"
+        case "$c" in
+            1) printf '%sThe exit key starts with %s.%s\n' "$DIM" "$EXIT_PREFIX" "$NC"
+               while :; do
+                   key=""
+                   read -r -p "Exit key (Enter = cancel): " key </dev/tty || true
+                   key="${key//[[:space:]]/}"
+                   [[ -n "$key" ]] || return 0
+                   exit_key_decode "$key" && break
+                   warn "Not a valid exit key. Copy the whole line again."
+               done ;;
+            2) ;;
+            *) return 0 ;;
+        esac
     fi
     if [[ -n "$key" ]]; then
         exit_key_decode "$key" || die "This exit key is not valid (copy it again, completely)."
         for n in $(tun_list); do
             [[ "$(conf_val "$TUN_DIR/$n.conf" ROLE)" == foreign && "$(conf_val "$TUN_DIR/$n.conf" IN4_PEER)" == "$E_IN4" ]] && tun="$n"
         done
-        [[ -n "$tun" ]] || die "No foreign-side tunnel has the Iran inner address $E_IN4. Create the tunnel first (section 1)."
+        [[ -n "$tun" ]] || die "No foreign-side tunnel has the Iran inner address $E_IN4. Create the tunnel first (gretun > 1) GRE tunnel)."
         v4="$E_V4" v6="$E_V6"
         if [[ -n "$E_IN6" && "$(conf_val "$TUN_DIR/$tun.conf" IN6_PEER)" != "$E_IN6" ]]; then
             warn "The Iran inner IPv6 in the key ($E_IN6) differs from tunnel $tun; IPv6 return routes may not work."
@@ -3385,18 +3587,23 @@ cmd_exit_add() {
     fi
     section "Exit through $tun"
     cat <<EOF
-  WAN interface:  IPv4 $( [[ $wan4 == auto ]] && wan_if 4 || echo "$wan4" )   IPv6 $( [[ $wan6 == auto ]] && wan_if 6 || echo "$wan6" )
-  MASQUERADE:     $(cidr_norm "${C[IN4_LOCAL]}/${C[IN4_PREFIX]}") $v4 $(cidr_norm "${C[IN6_LOCAL]}/64") $v6
-  return routes:  $v4 via ${C[IN4_PEER]}   ${v6:+$v6 via ${C[IN6_PEER]}}
-  forwarding:     on (accept_ra=2 on the WAN first, so its IPv6 stays)
+  Clients IPv4:   ${v4:-none}
+  Clients IPv6:   ${v6:-none}
+  Return via:     ${C[IN4_PEER]}${v6:+  ${C[IN6_PEER]}}
+  WAN interface:  IPv4 $( [[ $wan4 == auto ]] && wan_if 4 || echo "$wan4" ), IPv6 $( [[ $wan6 == auto ]] && wan_if 6 || echo "$wan6" )
+  MASQUERADE:     $(cidr_norm "${C[IN4_LOCAL]}/${C[IN4_PREFIX]}") $v4
+                  $(cidr_norm "${C[IN6_LOCAL]}/64") $v6
+  Forwarding:     on (the WAN keeps its IPv6: accept_ra=2)
 EOF
     [[ -n "$(wan_if 6)" || "$wan6" != auto ]] || warn "This server has no IPv6 default route: clients will get no IPv6."
-    confirm "Apply?" Y || return 0
+    confirm "Apply?" Y || { info "Nothing changed."; return 0; }
     rb_begin "exit via $tun"
     C=([TUNNEL]="$tun" [V4_SUBNETS]="$v4" [V6_SUBNETS]="$v6" [WAN4]="$wan4" [WAN6]="$wan6")
     write_file "$EXIT_DIR/$tun.conf" 640 "$(conf_text "${EXIT_KEYS[@]}")" || true
     sync_all || warn "Some parts could not be applied."
     exit_verify "$tun" || true
+    next_steps "If not done yet: set the PasarGuard panel (3) PasarGuard node > 4) Panel settings)." \
+        "Connect a WireGuard client and open a website, then keep the change (yes, or: gretun confirm)."
     rb_arm 600
 }
 exit_verify() {  # exit_verify TUNNEL
@@ -3538,7 +3745,8 @@ cmd_status() {
     done
     if rb_pending; then
         local left=$(( $(cat "$RB_PENDING/deadline" 2>/dev/null || date +%s) - $(date +%s) ))
-        warn "Waiting for confirmation: $(cat "$RB_PENDING/label") (rollback in ${left}s). Run: gretun confirm"
+        warn "Waiting for confirmation: $(cat "$RB_PENDING/label") (rollback in ${left}s)."
+        hint "Keep it: gretun confirm    Undo it now: gretun rollback"
     fi
 }
 
@@ -3761,6 +3969,15 @@ cmd_alert() {
     case "${ARGS[0]:-show}" in
         set)
             local url="${ARGS[1]:-$O_URL}"
+            if [[ -z "$url" ]] && (( HAVE_TTY && ! ASSUME_YES )); then
+                printf '%sExample: https://ntfy.sh/my-secret-topic or your own server%s\n' "$DIM" "$NC"
+                while :; do
+                    ask url "ntfy topic URL (Enter = cancel)"
+                    [[ -n "$url" ]] || { info "Nothing changed."; return 0; }
+                    [[ "$url" =~ ^https?:// ]] && break
+                    warn "The URL must start with http:// or https://"
+                done
+            fi
             [[ -n "$url" ]] || ask url "ntfy topic URL (e.g. https://ntfy.sh/my-secret-topic or your own server)"
             [[ "$url" =~ ^https?:// ]] || die "The URL must start with http:// or https://"
             need curl:curl
@@ -3911,56 +4128,198 @@ run_action() {  # each action in a subshell: an error returns to the menu
     ( take_lock; self_install; "$@" ) || true
     pause
 }
-banner() {
-    local n st line=""
-    clear 2>/dev/null || true
-    printf '%sgretun %s%s  - GRE tunnels, port forwarding, PasarGuard WireGuard exit\n' "$BOLD" "$VERSION" "$NC"
-    printf 'Server: %s   IPv4 %s   IPv6 %s\n' "$(hostname)" "$(detect_local 4 || true)" "$(detect_local 6 || true)"
+# What is set up on this server, for the dashboard and the menus.
+ST_TUN=0 ST_IRAN=0 ST_FOREIGN=0 ST_PG=0 ST_EXIT=0 ST_FWD=0
+menu_state() {
+    local n
+    local -a l=()
+    ST_TUN=0 ST_IRAN=0 ST_FOREIGN=0
     for n in $(tun_list); do
-        if iface_exists "$n"; then st="${GREEN}up${NC}"; else st="${RED}down${NC}"; fi
-        line+="$n($(conf_val "$TUN_DIR/$n.conf" ROLE),$st) "
+        ST_TUN=$((ST_TUN + 1))
+        case "$(conf_val "$TUN_DIR/$n.conf" ROLE)" in
+            iran) ST_IRAN=$((ST_IRAN + 1)) ;;
+            foreign) ST_FOREIGN=$((ST_FOREIGN + 1)) ;;
+        esac
     done
-    printf 'Tunnels: %s\n' "${line:-none}"
-    if rb_pending; then printf '%sWaiting for confirmation: %s  ->  Tools > Confirm%s\n' "$YELLOW" "$(cat "$RB_PENDING/label")" "$NC"; fi
+    l=("$PG_DIR"/*.conf); ST_PG=${#l[@]}
+    l=("$EXIT_DIR"/*.conf); ST_EXIT=${#l[@]}
+    fwd_load 2>/dev/null || true
+    ST_FWD=${#F_LISTEN[@]}
 }
-menu_tunnel() {
-    local c n
+server_role() {
+    if (( ST_IRAN && ST_FOREIGN )); then printf 'Iran and foreign server'
+    elif (( ST_IRAN )); then printf 'Iran (entry) server'
+    elif (( ST_FOREIGN )); then printf 'foreign (exit) server'
+    else printf 'no tunnel yet'; fi
+}
+rb_left() {  # time left on the safety timer, e.g. "2m 05s"
+    local d=""
+    d=$(cat "$RB_PENDING/deadline" 2>/dev/null) || d=""
+    [[ "$d" =~ ^[0-9]+$ ]] || { printf 'unknown time'; return 0; }
+    d=$((d - $(date +%s)))
+    (( d > 0 )) || d=0
+    printf '%dm %02ds' "$((d / 60))" "$((d % 60))"
+}
+pending_notice() {
+    rb_pending || return 0
+    printf '%s!! Waiting for confirmation:%s %s (%s left)\n' "$YELLOW$BOLD" "$NC" \
+        "$(cat "$RB_PENDING/label" 2>/dev/null)" "$(rb_left)"
+    printf '   Keep it: 6) Tools > 5     Undo it: 6) Tools > 6\n'
+}
+# banner: a short dashboard at the top of the main menu
+banner() {
+    local n w=4 cols v4 v6 to st col rtt tmp lab=Tunnels f
+    local -a names=()
+    clear 2>/dev/null || true
+    menu_state
+    cols=$(term_cols)
+    if (( cols >= 64 )); then
+        printf '%sgretun %s%s   %sGRE tunnels, port forwarding, PasarGuard exit%s\n' "$BOLD" "$VERSION" "$NC" "$DIM" "$NC"
+    else
+        printf '%sgretun %s%s\n' "$BOLD" "$VERSION" "$NC"
+    fi
+    hrule
+    printf '%-9s%s, %s\n' Server "$(hostname 2>/dev/null || echo '?')" "$(server_role)"
+    v4=$(detect_local 4) v6=$(detect_local 6)
+    if [[ -n "$v4" && -n "$v6" ]] && (( 9 + ${#v4} + 3 + ${#v6} <= cols )); then
+        printf '%-9s%s   %s\n' IP "$v4" "$v6"
+    else
+        if [[ -n "$v4" ]]; then printf '%-9s%s\n' IPv4 "$v4"; fi
+        if [[ -n "$v6" ]]; then printf '%-9s%s\n' IPv6 "$v6"; fi
+    fi
+    mapfile -t names < <(tun_list)
+    if (( ${#names[@]} == 0 )); then
+        printf '%-9s%s\n' Tunnels "none yet"
+    else
+        # One ping per tunnel, all at once, so the menu opens quickly.
+        tmp=$(mktemp -d)
+        for n in "${names[@]}"; do
+            (( ${#n} <= w )) || w=${#n}
+            if iface_exists "$n"; then
+                ( if ping_peer "$(conf_val "$TUN_DIR/$n.conf" IN4_PEER)" 1; then printf '%s' "$PING_RTT" >"$tmp/$n"
+                  else : >"$tmp/$n"; fi ) &
+            fi
+        done
+        wait
+        for n in "${names[@]}"; do
+            case "$(conf_val "$TUN_DIR/$n.conf" ROLE)" in iran) to="to foreign" ;; foreign) to="to Iran" ;; *) to="?" ;; esac
+            if [[ ! -e "$tmp/$n" ]]; then st=down col="$RED"
+            elif [[ -s "$tmp/$n" ]]; then
+                rtt=$(<"$tmp/$n") rtt="${rtt%.*}"
+                if [[ "$rtt" == 0 ]]; then st="up <1 ms"; else st="up $rtt ms"; fi
+                col="$GREEN"
+            else st="no reply" col="$YELLOW"; fi
+            f=$(conf_val "$TUN_DIR/$n.conf" REMOTE)
+            printf '%-9s%-*s  %-10s  ' "$lab" "$w" "$n" "$to"
+            if (( 9 + w + 2 + 10 + 2 + 11 + 1 + ${#f} <= cols )); then
+                printf '%s%-11s%s %s%s%s\n' "$col" "$st" "$NC" "$DIM" "$f" "$NC"
+            else
+                printf '%s%s%s\n' "$col" "$st" "$NC"
+            fi
+            lab=""
+        done
+        rm -rf "$tmp"
+    fi
+    if (( ST_FWD )); then
+        printf '%-9s%s port(s): TCP %s, UDP %s\n' Forward "$ST_FWD" "$(fwd_count tcp)" "$(fwd_count udp)"
+    fi
+    for f in "$PG_DIR"/*.conf; do
+        printf '%-9s%s via %s, WireGuard %s\n' "PG node" "$(conf_val "$f" NODE)" "$(conf_val "$f" TUNNEL)" "$(conf_val "$f" WG_IF wg0)"
+    done
+    for f in "$EXIT_DIR"/*.conf; do
+        printf '%-9svia %s for %s\n' Exit "$(conf_val "$f" TUNNEL)" "$(conf_val "$f" V4_SUBNETS)"
+    done
+    if [[ -f "$ALERT_CONF" ]]; then printf '%-9s%s\n' Alerts "on (ntfy)"; fi
+    hrule
+    if (( ST_TUN == 0 )); then
+        printf '%sStart:%s on the foreign server choose 1) GRE tunnel > 1),\n' "$BOLD" "$NC"
+        printf '       then paste its key on the Iran server: 1) > 2).\n'
+    fi
+    pending_notice
+}
+menu_head() {  # a sub-menu starts on a clean screen with the context on top
+    clear 2>/dev/null || true
+    menu_state
+    printf '%sgretun %s | %s%s\n' "$DIM" "$VERSION" "$(server_role)" "$NC"
+    pending_notice
+}
+# Pastes a connection key, again and again until it is valid; Enter cancels.
+ask_conn_key() {  # ask_conn_key VAR
+    local __ck_k
+    printf '%sThe key starts with %s and is printed on the foreign server.%s\n' "$DIM" "$KEY_PREFIX" "$NC"
     while :; do
+        __ck_k=""
+        read -r -p "Connection key (Enter = cancel): " __ck_k </dev/tty || true
+        __ck_k="${__ck_k//[[:space:]]/}"
+        [[ -n "$__ck_k" ]] || return 1
+        if key_decode "$__ck_k"; then printf -v "$1" '%s' "$__ck_k"; return 0; fi
+        warn "Not a valid connection key. Copy the whole line again."
+    done
+}
+# mi OK "Label" "hint" "reason": one menu item for choose; with OK=0 it is
+# shown with the reason and cannot be chosen.
+mi() { if (( $1 )); then printf '%s|%s' "$2" "$3"; else printf '~%s|%s' "$2" "$4"; fi; }
+menu_tunnel() {
+    local c k a
+    while :; do
+        menu_head
         choose c "1) GRE tunnel" \
-            "Foreign (exit) server: create a tunnel and print the connection key" \
-            "Iran (entry) server: paste a connection key" \
-            "Manual setup (either server)" \
-            "List tunnels and status (ping, traffic)" \
-            "Show the connection key of a tunnel" \
-            "Remove a tunnel" \
-            "Import an existing tunnel (gre1 manual / haproxy-forwarder)" \
-            "Alerts (ntfy) when a tunnel goes down" \
-            "Edit a tunnel (MTU, server addresses, tunnel network, role)" \
-            "Iran server: forward ports through a tunnel to the foreign server"
+            "#New tunnel (foreign server first)" \
+            "Foreign: new tunnel|prints a key for Iran" \
+            "Iran: paste the key|connects, then tests" \
+            "Iran: manual setup|no key: type the values" \
+            "#Manage" \
+            "$(mi "$ST_TUN" "List and status" "ping, traffic" "no tunnel yet")" \
+            "$(mi "$ST_FOREIGN" "Show the connection key" "for the Iran server" "needs a foreign-side tunnel")" \
+            "$(mi "$ST_TUN" "Edit a tunnel" "MTU, addresses, network, role" "no tunnel yet")" \
+            "$(mi "$ST_IRAN" "Forward ports" "Iran port -> foreign server" "needs an Iran-side tunnel")" \
+            "$(mi "$ST_TUN" "Remove a tunnel" "" "no tunnel yet")" \
+            "#More" \
+            "Import a tunnel|gre1 or haproxy-forwarder" \
+            "Alerts (ntfy)|when a tunnel goes down"
+        ARGS=()
         case "$c" in
             0) return 0 ;;
             1) O_ROLE=foreign; run_action cmd_tunnel_add; O_ROLE="" ;;
-            2) ask n "Paste the connection key"; O_KEY="$n"; run_action cmd_tunnel_add; O_KEY="" ;;
-            3) run_action cmd_tunnel_add ;;
+            2) if ask_conn_key k; then O_KEY="$k"; run_action cmd_tunnel_add; O_KEY=""; fi ;;
+            3) O_ROLE=iran; run_action cmd_tunnel_add; O_ROLE="" ;;
             4) run_action tunnel_status ;;
-            5) ARGS=(); run_action cmd_tunnel_key ;;
-            6) ARGS=(); run_action cmd_tunnel_remove ;;
-            7) ARGS=(); run_action cmd_import ;;
-            8) local a
-               choose a "Alerts" "Set the ntfy URL" "Send a test alert" "Turn alerts off"
-               case "$a" in 1) ARGS=(set) ;; 2) ARGS=(test) ;; 3) ARGS=(off) ;; *) continue ;; esac
-               run_action cmd_alert ;;
-            9) ARGS=(); run_action cmd_tunnel_edit ;;
-            10) ARGS=(); run_action cmd_tunnel_forward ;;
+            5) run_action cmd_tunnel_key ;;
+            6) run_action cmd_tunnel_edit ;;
+            7) run_action cmd_tunnel_forward ;;
+            8) run_action cmd_tunnel_remove ;;
+            9) run_action cmd_import ;;
+            10) if [[ -f "$ALERT_CONF" ]]; then
+                    choose a "Alerts: on ($(conf_val "$ALERT_CONF" NTFY_URL))" \
+                        "Change the ntfy URL" "Send a test alert" "Turn alerts off"
+                else
+                    choose a "Alerts: off" "Set the ntfy URL|e.g. https://ntfy.sh/your-topic" \
+                        "~Send a test alert|alerts are off" "~Turn alerts off|alerts are off"
+                fi
+                case "$a" in 1) ARGS=(set) ;; 2) ARGS=(test) ;; 3) ARGS=(off) ;; *) continue ;; esac
+                run_action cmd_alert ;;
         esac
     done
 }
 menu_fwd() {
-    local c
+    local c inst
     while :; do
-        choose c "2) Port forwarding through a tunnel (Iran port -> foreign server)" \
-            "Add ports" "List rules" "Remove ports" "Status (services, connections, traffic)" \
-            "Live monitor" "Rebuild configs from the rules file" "Uninstall the forwarder"
+        menu_head
+        inst=0
+        if (( ST_FWD )) || [[ -f "$RULES" || -f "$UDP_CFG" ]]; then inst=1; fi
+        if (( ST_FWD )); then
+            printf '\nRules: %s port(s), TCP %s, UDP %s\n' "$ST_FWD" "$(fwd_count tcp)" "$(fwd_count udp)"
+        elif (( ! ST_IRAN )); then
+            printf '\n%sPorts are forwarded on the Iran server, through a tunnel.%s\n' "$DIM" "$NC"
+        fi
+        choose c "2) Port forwarding (Iran port -> foreign server)" \
+            "$(mi "$ST_IRAN" "Add ports" "through a tunnel" "needs an Iran-side tunnel")" \
+            "$(mi "$ST_FWD" "List rules" "" "no rules yet")" \
+            "$(mi "$ST_FWD" "Remove ports" "" "no rules yet")" \
+            "$(mi "$ST_FWD" "Status" "services, connections, traffic" "no rules yet")" \
+            "$(mi "$ST_FWD" "Live monitor" "speed per port, Ctrl+C stops" "no rules yet")" \
+            "$(mi "$ST_FWD" "Rebuild configs" "from the rules file" "no rules yet")" \
+            "$(mi "$inst" "Uninstall the forwarder" "all rules and services" "nothing installed")"
         ARGS=()
         case "$c" in
             0) return 0 ;; 1) run_action cmd_fwd_add ;; 2) run_action cmd_fwd_list ;; 3) run_action cmd_fwd_remove ;;
@@ -3969,36 +4328,77 @@ menu_fwd() {
         esac
     done
 }
+menu_pg_key() {
+    local f
+    section "Exit key for the foreign server"
+    for f in "$PG_DIR"/*.conf; do
+        printf 'Node %s:\n%s%s%s\n\n' "$(basename "$f" .conf)" "$GREEN$BOLD" \
+            "$(exit_key "$(conf_val "$f" TUNNEL)" "$(conf_val "$f" V4_SUBNETS)" "$(conf_val "$f" V6_SUBNETS)")" "$NC"
+    done
+    next_steps "On the foreign server: gretun > 3) PasarGuard node > 2) Foreign: add the exit, and paste the key."
+}
 menu_pg() {
     local c
     while :; do
+        menu_head
         choose c "3) PasarGuard WireGuard node via GRE" \
-            "Iran server: set up the node (send WG clients out through a tunnel)" \
-            "Foreign server: add the exit (paste the exit key)" \
-            "Check everything (status / verify)" \
-            "Show what to set in the PasarGuard panel" \
-            "Show the exit key again (Iran)" \
-            "Iran: undo the node setup" \
-            "Foreign: remove an exit" \
-            "Iran: edit the node setup (WireGuard interface, subnets, table, tunnel)" \
-            "Foreign: edit an exit (subnets, WAN interface)"
+            "#Set up (Iran first, then foreign)" \
+            "$(mi "$ST_IRAN" "Iran: set up the node" "clients leave via a tunnel" "needs an Iran-side tunnel")" \
+            "$(mi "$ST_FOREIGN" "Foreign: add the exit" "paste the exit key from Iran" "needs a foreign-side tunnel")" \
+            "#Check" \
+            "$(mi "$(( ST_PG + ST_EXIT ))" "Check everything" "on either server" "nothing set up yet")" \
+            "Panel settings|what to set in the panel" \
+            "#Iran server" \
+            "$(mi "$ST_PG" "Show the exit key again" "" "no node set up here")" \
+            "$(mi "$ST_PG" "Edit the node setup" "WG interface, subnets, table" "no node set up here")" \
+            "$(mi "$ST_PG" "Undo the node setup" ".env back to its old values" "no node set up here")" \
+            "#Foreign server" \
+            "$(mi "$ST_EXIT" "Edit an exit" "subnets, WAN interface" "no exit set up here")" \
+            "$(mi "$ST_EXIT" "Remove an exit" "NAT and return routes" "no exit set up here")"
         ARGS=()
         case "$c" in
             0) return 0 ;; 1) run_action cmd_pg_setup ;; 2) run_action cmd_exit_add ;; 3) run_action cmd_pg_status ;;
-            4) run_action cmd_pg_panel ;; 5) run_action cmd_pg_key ;; 6) run_action cmd_pg_remove ;; 7) run_action cmd_exit_remove ;;
-            8) run_action cmd_pg_edit ;; 9) run_action cmd_exit_edit ;;
+            4) run_action cmd_pg_panel ;; 5) run_action menu_pg_key ;; 6) run_action cmd_pg_edit ;;
+            7) run_action cmd_pg_remove ;; 8) run_action cmd_exit_edit ;; 9) run_action cmd_exit_remove ;;
         esac
     done
 }
-menu_tools() {
-    local c
+# Asks for the path of a copied gretun file until it exists; 0 cancels.
+ask_update_file() {  # ask_update_file VAR
+    local __uf
     while :; do
-        choose c "Tools" \
-            "Speed test over a tunnel (iperf3 client)" "Speed test server (run on the other side first)" \
-            "Tuning: apply BBR + fq, buffers, conntrack" "Tuning: revert" \
-            "Confirm the pending change" "Roll back the pending change now" \
-            "Repair now (heal)" "Update gretun (download the latest version from GitHub)" \
-            "Update gretun from a local file (copied with scp)" "Uninstall gretun"
+        __uf=""
+        read -r -p "New gretun file [/root/gretun] (0 = cancel): " __uf </dev/tty || true
+        __uf="${__uf:-/root/gretun}"
+        [[ "$__uf" != 0 ]] || return 1
+        if [[ -f "$__uf" ]]; then printf -v "$1" '%s' "$__uf"; return 0; fi
+        warn "File not found: $__uf"
+        hint "Copy it here first, e.g. from your computer:"
+        hint "scp gretun root@THIS_SERVER:/root/gretun"
+    done
+}
+menu_tools() {
+    local c tuned pend label
+    while :; do
+        menu_head
+        tuned=0 pend=0 label=""
+        if [[ -f "$SYSCTL_TUNE" ]]; then tuned=1; fi
+        if rb_pending; then pend=1 label=$(cat "$RB_PENDING/label" 2>/dev/null || true); fi
+        choose c "6) Tools" \
+            "#Speed test (iperf3)" \
+            "$(mi "$ST_TUN" "Speed test" "from here over a tunnel" "needs a tunnel")" \
+            "$(mi "$ST_TUN" "Speed test server" "start this on the other side" "needs a tunnel")" \
+            "#Tuning" \
+            "Tuning: apply|BBR + fq, buffers, conntrack" \
+            "$(mi "$tuned" "Tuning: revert" "back to the old values" "tuning is not applied")" \
+            "#Pending change" \
+            "$(mi "$pend" "Keep the pending change" "$label" "nothing is waiting")" \
+            "$(mi "$pend" "Undo the pending change" "right now" "nothing is waiting")" \
+            "#Maintenance" \
+            "Repair now (heal)|re-apply tunnels and rules" \
+            "Update from GitHub|download the latest gretun" \
+            "Update from a file|a copy sent here with scp" \
+            "Uninstall gretun|removes everything it set up"
         ARGS=()
         case "$c" in
             0) return 0 ;;
@@ -4006,20 +4406,28 @@ menu_tools() {
             2) BENCH_SERVER=1; ( cmd_bench ) || true; BENCH_SERVER=0 ;;
             3) ARGS=(apply); run_action cmd_tune ;; 4) ARGS=(revert); run_action cmd_tune ;;
             5) run_action rb_confirm ;; 6) run_action rb_fire ;;
-            7) ( cmd_heal ) || true; ok "Done."; pause ;;
+            7) ( cmd_heal ) || true; ok "Done. Check the result with: 5) Doctor"; pause ;;
             8) O_FILE=""; GRETUN_IN_MENU=1 run_action cmd_update ;;
-            9) ask O_FILE "Path of the new gretun file" /root/gretun; GRETUN_IN_MENU=1 run_action cmd_update; O_FILE="" ;;
+            9) if ask_update_file O_FILE; then GRETUN_IN_MENU=1 run_action cmd_update; fi; O_FILE="" ;;
             10) run_action cmd_uninstall ;;
         esac
     done
 }
 menu_main() {
     (( HAVE_TTY )) || die "No terminal for the menu. Use the CLI: gretun help"
-    local c
+    local c fwd
+    IN_MENU=1
     while :; do
         banner
-        choose c "Main menu" "GRE tunnel" "Port forwarding through a tunnel" "PasarGuard WireGuard node via GRE" \
-            "Status of everything" "Doctor (find problems, with hints)" "Tools (speed test, tuning, confirm/rollback, uninstall)"
+        fwd=0
+        if (( ST_IRAN || ST_FWD )) || [[ -f "$RULES" || -f "$UDP_CFG" ]]; then fwd=1; fi
+        choose c "Main menu" \
+            "GRE tunnel|create, connect, list, edit" \
+            "$(mi "$fwd" "Port forwarding" "Iran port -> foreign server" "needs an Iran-side tunnel")" \
+            "$(mi "$(( ST_TUN + ST_PG + ST_EXIT ))" "PasarGuard node" "WireGuard clients exit abroad" "needs a tunnel first")" \
+            "Status|everything at a glance" \
+            "Doctor|find problems, with hints" \
+            "Tools|speed test, tuning, update"
         case "$c" in
             0) exit 0 ;; 1) menu_tunnel ;; 2) menu_fwd ;; 3) menu_pg ;;
             4) run_action cmd_status ;; 5) run_action cmd_doctor ;; 6) menu_tools ;;
