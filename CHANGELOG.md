@@ -1,5 +1,15 @@
 # Changelog
 
+## 1.6.2 — 2026-11-23
+
+- Fix: adding a forwarded port looked frozen on servers without HAProxy. apt ran with all its
+  output hidden and without time limits, so on an Iran server that cannot reach the package
+  mirror it waited for many minutes in silence. apt's progress is now shown, each download
+  gives up after 20 s, `apt-get update` after 3 minutes and the install after 10 minutes, with
+  a hint about installing the packages offline.
+- Starting, reloading or stopping HAProxy / the UDP forwarder can no longer hang gretun
+  (90 s limit).
+
 ## 1.6.1 — 2026-11-22
 
 - Fix: an exit whose return route was set up by hand before (same subnet through the same

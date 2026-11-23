@@ -26,7 +26,7 @@
 set -Eeuo pipefail
 shopt -s nullglob
 
-readonly VERSION="1.6.1"
+readonly VERSION="1.6.2"
 readonly MARK="# Managed by gretun"
 
 # GRETUN_ROOT prefixes every path and switches off systemd/udev calls. It is
@@ -523,16 +523,27 @@ conf_val() {  # conf_val FILE KEY [default]: one value without touching C
 
 # ---------------------------------------------------------------- packages
 APT_UPDATED=0
+# apt on an Iran server often cannot reach its mirror and then waits for many
+# minutes without a word. Its output is shown (on stderr, callers hide stdout),
+# every download gives up after 20 s, and the whole step after a few minutes.
+APT_OPTS=(-o Acquire::http::Timeout=20 -o Acquire::https::Timeout=20 -o Acquire::Retries=1
+    -o DPkg::Lock::Timeout=120)
 apt_install() {
     (( HEAL_MODE )) && return 1
     if (( ! APT_UPDATED )); then
-        info "Updating package lists (apt)..."
-        run apt-get update -q || warn "apt-get update failed; trying with the cached lists."
+        info "Updating package lists (apt, at most 3 minutes)..." >&2
+        run timeout 180 apt-get update -q "${APT_OPTS[@]}" </dev/null >&2 9>&- \
+            || warn "apt-get update failed or timed out (no access to the package mirror?); trying with the cached lists."
         APT_UPDATED=1
     fi
-    info "Installing: $*"
-    run env DEBIAN_FRONTEND=noninteractive apt-get install -y -q \
-        -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold "$@"
+    info "Installing: $* (at most 10 minutes)" >&2
+    if ! run timeout 600 env DEBIAN_FRONTEND=noninteractive apt-get install -y -q "${APT_OPTS[@]}" \
+        -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold "$@" </dev/null >&2 9>&-; then
+        err "Installing $* failed or timed out."
+        hint "If this server cannot reach the package mirror (common in Iran), install the package(s)"
+        hint "from a local mirror or as .deb files first (README: Offline install), then try again."
+        return 1
+    fi
 }
 need() {  # need CMD:PACKAGE...
     local item cmd pkg
@@ -2282,7 +2293,8 @@ parse_ports() {
 ensure_haproxy() {
     have haproxy && return 0
     (( HEAL_MODE )) && return 1
-    confirm "HAProxy (TCP forwarding) is not installed. Install it now?" Y || die "HAProxy is required for TCP rules."
+    printf '%sHAProxy is needed for TCP forwarding and is installed with apt (needs the package mirror).%s\n' "$DIM" "$NC" >&2
+    confirm "HAProxy is not installed. Install it now?" Y || die "HAProxy is required for TCP rules."
     apt_install haproxy >/dev/null || die "Could not install HAProxy (see README: offline install)."
     if (( ! DRY )); then mkdir -p "$ETC"; touch "$ETC/.installed-haproxy"; fi
 }
@@ -2512,16 +2524,17 @@ svc_up() {  # svc_up UNIT: hitless reload when running, start otherwise
         if test_daemon_active "$1"; then test_daemon reload "$1"; else test_daemon start "$1"; fi
         return
     fi
-    run systemctl enable "$1" >/dev/null 2>&1 || true
+    # A service that does not start must not hang gretun: 90 s at most.
+    run timeout 60 systemctl enable "$1" >/dev/null 2>&1 9>&- || true
     if svc_active "$1"; then
-        run systemctl reload "$1" || run systemctl restart "$1"
+        run timeout 90 systemctl reload "$1" 9>&- || run timeout 90 systemctl restart "$1" 9>&-
     else
-        run systemctl restart "$1"
+        run timeout 90 systemctl restart "$1" 9>&-
     fi
 }
 svc_down() {
     if (( TEST_MODE )); then test_daemon stop "$1"; return 0; fi
-    run systemctl disable --now "$1" >/dev/null 2>&1 || true
+    run timeout 90 systemctl disable --now "$1" >/dev/null 2>&1 9>&- || true
 }
 port_listening() {  # port_listening tcp|udp PORT
     local f=-lnt
