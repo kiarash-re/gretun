@@ -113,12 +113,14 @@ if [[ -n "${GRETUN_ASCII:-}" ]]; then UTF=0; fi
 
 # ---------------------------------------------------------------- output
 jlog() { logger -t gretun -- "$*" >/dev/null 2>&1 || true; }
-info() { printf '%s[..]%s %s\n' "$BLUE" "$NC" "$*"; }
-ok()   { printf '%s[OK]%s %s\n' "$GREEN" "$NC" "$*"; jlog "ok: $*"; }
-warn() { printf '%s[!!]%s %s\n' "$YELLOW" "$NC" "$*" >&2; jlog "warning: $*"; }
-err()  { printf '%s[XX]%s %s\n' "$RED" "$NC" "$*" >&2; jlog "error: $*"; }
+# The message helpers never fail: after SSH drops the terminal is gone, and a
+# failed write must not stop a change half-way (errexit).
+info() { printf '%s[..]%s %s\n' "$BLUE" "$NC" "$*" 2>/dev/null || true; }
+ok()   { printf '%s[OK]%s %s\n' "$GREEN" "$NC" "$*" 2>/dev/null || true; jlog "ok: $*"; }
+warn() { printf '%s[!!]%s %s\n' "$YELLOW" "$NC" "$*" >&2 2>/dev/null || true; jlog "warning: $*"; }
+err()  { printf '%s[XX]%s %s\n' "$RED" "$NC" "$*" >&2 2>/dev/null || true; jlog "error: $*"; }
 die()  { err "$*"; exit 1; }
-hint() { printf '     %s-> %s%s\n' "$DIM" "$*" "$NC"; }
+hint() { printf '     %s-> %s%s\n' "$DIM" "$*" "$NC" 2>/dev/null || true; }
 # section "Title": a bold title followed by a dim rule, e.g. "Tunnels ──────"
 section() {
     local w l
@@ -128,7 +130,7 @@ section() {
     (( w < 3 )) && w=3
     printf -v l '%*s' "$w" ''
     if (( UTF )); then l="${l// /─}"; else l="${l// /-}"; fi
-    printf '\n%s%s%s %s%s%s\n' "$BOLD" "$*" "$NC" "$DIM" "$l" "$NC"
+    printf '\n%s%s%s %s%s%s\n' "$BOLD" "$*" "$NC" "$DIM" "$l" "$NC" 2>/dev/null || true
 }
 quiet() { "$@" >/dev/null 2>&1; }
 have() { command -v "$1" >/dev/null 2>&1; }
@@ -228,6 +230,7 @@ term_cols() {
     if (( HAVE_TTY )); then c=$(tput cols 2>/dev/null </dev/tty) || c=""; fi
     [[ "$c" =~ ^[0-9]+$ ]] && (( c >= 20 )) || c="${COLUMNS:-80}"
     [[ "$c" =~ ^[0-9]+$ ]] || c=80
+    (( c >= 20 )) || c=20
     printf '%s' "$c"
 }
 # cpad TEXT WIDTH: TEXT padded to WIDTH visible columns (colour codes take none),
@@ -687,13 +690,13 @@ rb_begin() {  # rb_begin "label"
     if rb_pending; then
         die "A change is still waiting for confirmation ($(cat "$RB_PENDING/label" 2>/dev/null)). Run 'gretun confirm' or 'gretun rollback' first."
     fi
-    if (( ! TEST_MODE )) && [[ ! -x "$SELF" ]]; then
-        die "The rollback needs gretun installed at $SELF: run 'bash $0 install' first."
-    fi
     if (( DRY )); then
         printf '%s[dry-run]%s rollback snapshot: %s\n' "$DIM" "$NC" "$1"
         RB_ACTIVE=1
         return 0
+    fi
+    if (( ! TEST_MODE )) && [[ ! -x "$SELF" ]]; then
+        die "The rollback needs gretun installed at $SELF: run 'bash $0 install' first."
     fi
     mkdir -p "$RB_PENDING/files"
     printf '%s\n' "$1" >"$RB_PENDING/label"
@@ -715,10 +718,9 @@ rb_begin() {  # rb_begin "label"
     # The timer runs from now on, not only after the change: if the change cuts
     # the SSH session or gretun stops half-way, the timer still undoes it.
     rb_start_timer "${RB_SECS:-900}"
-    # A dropped SSH session must not stop gretun half-way through a change:
-    # from then on its output goes to a log file instead of the dead terminal.
-    mkdir -p "$LOG_DIR" 2>/dev/null || true
-    trap 'exec </dev/null >>"$LOG_DIR/gretun.log" 2>&1; jlog "SSH session lost; output now in $LOG_DIR/gretun.log"' HUP
+    # A dropped SSH session must not stop gretun (or apt, haproxy, systemctl it
+    # runs: an ignored signal is inherited) half-way through a change.
+    trap '' HUP
 }
 rb_start_timer() {  # rb_start_timer SECONDS: (re)starts the rollback timer
     if (( TEST_MODE )); then

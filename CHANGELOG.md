@@ -12,10 +12,11 @@ Fixes from a second full review:
   lifetime to "today" (e.g. right after updating to 1.6.x).
 - When heal recreates a tunnel that stopped answering, its routes are put back at once (clients
   had no internet for up to a minute).
-- If SSH drops during a change, gretun finishes it and writes its output to
-  /var/log/gretun/gretun.log (before, the change could stop half-way).
-- A problem in one tunnel no longer makes creating another tunnel fail. Removing a tunnel now has
-  the safety timer like other routing changes.
+- If SSH drops during a change, gretun finishes it: a failed message to the dead terminal no
+  longer stops it half-way.
+- A problem in one tunnel no longer makes creating another tunnel fail.
+- `tunnel remove` now has the safety timer like other routing changes: confirm with
+  `gretun confirm`, or pass `--confirm` in scripts.
 - Firewall: new connections from the internet towards the clients behind a tunnel are now really
   dropped (the rule only accepted replies, but nothing dropped the rest).
 - docker, apt purge and other slow commands are time-limited; ping is read in the C locale (a
