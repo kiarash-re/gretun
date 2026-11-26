@@ -4,6 +4,7 @@
 # macOS (bash 5 needed: brew install bash).
 #
 #   bash tests/unit-test.sh            (or: /opt/homebrew/bin/bash tests/unit-test.sh)
+# shellcheck disable=SC2016  # the test bodies and shims are single-quoted on purpose
 set -u
 HERE=$(cd "$(dirname "$0")" && pwd)
 SRC="$HERE/../gretun"
