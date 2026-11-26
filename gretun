@@ -106,6 +106,9 @@ set_colors
 # otherwise (or with GRETUN_ASCII=1).
 UTF=0
 case "${LC_ALL:-${LC_CTYPE:-${LANG:-}}}" in *[Uu][Tt][Ff]-8*|*[Uu][Tt][Ff]8*) UTF=1 ;; esac
+# A UTF-8 name forwarded by SSH (e.g. LC_CTYPE=UTF-8 from a Mac) that this
+# system does not have falls back to C: then widths would be counted in bytes.
+if (( UTF )) && command -v locale >/dev/null 2>&1 && [[ "$(locale charmap 2>/dev/null)" != UTF-8 ]]; then UTF=0; fi
 if [[ -n "${GRETUN_ASCII:-}" ]]; then UTF=0; fi
 
 # ---------------------------------------------------------------- output
@@ -156,10 +159,13 @@ write_file() {
         return 0
     fi
     mkdir -p "$(dirname "$path")"
-    tmp=$(mktemp "$path.XXXXXX")
-    printf '%s\n' "$content" >"$tmp"
-    chmod "$mode" "$tmp"
-    mv -f "$tmp" "$path"
+    tmp=$(mktemp "$path.XXXXXX") || die "Could not write $path (disk full?)."
+    # Every step is checked: in the menu errexit is off, and a failed write
+    # must never replace a good file with an empty one.
+    if ! { printf '%s\n' "$content" >"$tmp" && chmod "$mode" "$tmp" && mv -f "$tmp" "$path"; }; then
+        rm -f "$tmp"
+        die "Could not write $path (disk full?); it was not changed."
+    fi
     jlog "wrote $path"
     return 0
 }
@@ -641,6 +647,9 @@ rb_begin() {  # rb_begin "label"
     if rb_pending; then
         die "A change is still waiting for confirmation ($(cat "$RB_PENDING/label" 2>/dev/null)). Run 'gretun confirm' or 'gretun rollback' first."
     fi
+    if (( ! TEST_MODE )) && [[ ! -x "$SELF" ]]; then
+        die "The rollback needs gretun installed at $SELF: run 'bash $0 install' first."
+    fi
     if (( DRY )); then
         printf '%s[dry-run]%s rollback snapshot: %s\n' "$DIM" "$NC" "$1"
         RB_ACTIVE=1
@@ -666,8 +675,10 @@ rb_begin() {  # rb_begin "label"
     # The timer runs from now on, not only after the change: if the change cuts
     # the SSH session or gretun stops half-way, the timer still undoes it.
     rb_start_timer "${RB_SECS:-900}"
-    # A dropped SSH session must not stop gretun half-way through a change.
-    trap '' HUP
+    # A dropped SSH session must not stop gretun half-way through a change:
+    # from then on its output goes to a log file instead of the dead terminal.
+    mkdir -p "$LOG_DIR" 2>/dev/null || true
+    trap 'exec </dev/null >>"$LOG_DIR/gretun.log" 2>&1; jlog "SSH session lost; output now in $LOG_DIR/gretun.log"' HUP
 }
 rb_start_timer() {  # rb_start_timer SECONDS: (re)starts the rollback timer
     if (( TEST_MODE )); then
@@ -696,7 +707,8 @@ rb_save_file() {  # rb_save_file PATH: restored as it is now
     local n
     n=$(find "$RB_PENDING/files" -maxdepth 1 -type f -name '*.file' | wc -l)
     if [[ -e "$1" ]]; then
-        cp -a "$1" "$RB_PENDING/files/$n.file"
+        cp -a "$1" "$RB_PENDING/files/$n.file" \
+            || die "Could not save a copy of $1 for the rollback (disk full?); nothing more is changed."
         printf 'restore %s %s\n' "$n" "$1" >>"$RB_PENDING/files/index"
     else
         : >"$RB_PENDING/files/$n.file"
@@ -782,7 +794,7 @@ rb_fire() {
     warn "Rolling back: $(cat "$RB_PENDING/label" 2>/dev/null)"
     if [[ -s "$RB_PENDING/undo" ]]; then
         tac "$RB_PENDING/undo" | while read -r line; do
-            eval "$line" >/dev/null 2>&1 || true
+            eval "$line" </dev/null >/dev/null 2>&1 || true
         done
     fi
     if [[ -f "$RB_PENDING/snapshot.tgz" ]] && ! tar -tzf "$RB_PENDING/snapshot.tgz" >/dev/null 2>&1; then
@@ -810,7 +822,7 @@ rb_fire() {
         done
     fi
     if [[ -f "$RB_PENDING/restart" ]]; then
-        while read -r line; do eval "$line" >/dev/null 2>&1 || true; done <"$RB_PENDING/restart"
+        while read -r line; do eval "$line" </dev/null >/dev/null 2>&1 || true; done <"$RB_PENDING/restart"
     fi
     rm -rf "$RB_PENDING"
     alert "Change rolled back on $(hostname)" || true
@@ -851,7 +863,7 @@ owned_del() {
     [[ -f "$OWNED" ]] || return 0
     local tmp
     tmp=$(grep -vx -- "$1" "$OWNED" || true)
-    printf '%s\n' "$tmp" | sed '/^$/d' >"$OWNED"
+    printf '%s\n' "$tmp" | sed '/^$/d' >"$OWNED.$$" && mv -f "$OWNED.$$" "$OWNED"
 }
 
 next_tun_name() {
@@ -1004,7 +1016,8 @@ offload_apply() {  # gso/gro/tso off on one interface (never on a physical NIC)
     have ethtool && iface_exists "$1" || return 0
     cur=$(ethtool -k "$1" 2>/dev/null) || return 0
     for f in generic-segmentation-offload:gso generic-receive-offload:gro tcp-segmentation-offload:tso; do
-        if grep -q "^${f%%:*}: on" <<<"$cur"; then
+        # "on [fixed]" cannot be changed: only a plain "on" is switched off.
+        if grep -q "^${f%%:*}: on$" <<<"$cur"; then
             run ethtool -K "$1" "${f#*:}" off >/dev/null 2>&1 || true
         fi
     done
@@ -1074,7 +1087,7 @@ ping_peer() {  # ping_peer ADDR [count]: sets PING_RTT (ms) and PING_LOSS (%)
     if [[ "$1" == *:* ]]; then fam=6; fi
     PING_RTT="-" PING_LOSS="100"
     [[ -n "$1" ]] || return 1
-    out=$(ping "-$fam" -n -q -c "${2:-3}" -W 2 -i 0.3 "$1" 2>/dev/null) || true
+    out=$(LC_ALL=C ping "-$fam" -n -q -c "${2:-3}" -W 2 -i 0.3 "$1" 2>/dev/null) || true
     PING_LOSS=$(awk -F', ' '/packet loss/ {for (i = 1; i <= NF; i++) if ($i ~ /packet loss/) {sub(/%.*/, "", $i); print $i}}' <<<"$out")
     PING_RTT=$(awk -F'/' '/^rtt|^round-trip/ {print $5}' <<<"$out")
     PING_LOSS="${PING_LOSS:-100}" PING_RTT="${PING_RTT:--}"
@@ -1254,9 +1267,14 @@ fw_sync() {
         read -r a b est <<<"$pair"
         # From the internet into the tunnel only replies (no new connections to clients).
         if [[ "$est" == est ]]; then
+            # The forward chain accepts by default (and Debian's FORWARD too), so new
+            # connections from the internet to the clients are dropped explicitly.
             frules+="        iifname \"$a\" oifname \"$b\" ct state established,related accept$nl"
+            frules+="        iifname \"$a\" oifname \"$b\" ct state new drop$nl"
             ipt4+="-A GRETUN-FWD -i $a -o $b -m conntrack --ctstate ESTABLISHED,RELATED -m comment --comment gretun -j ACCEPT$nl"
+            ipt4+="-A GRETUN-FWD -i $a -o $b -m conntrack --ctstate NEW -m comment --comment gretun -j DROP$nl"
             ipt6+="-A GRETUN-FWD -i $a -o $b -m conntrack --ctstate ESTABLISHED,RELATED -m comment --comment gretun -j ACCEPT$nl"
+            ipt6+="-A GRETUN-FWD -i $a -o $b -m conntrack --ctstate NEW -m comment --comment gretun -j DROP$nl"
         else
             frules+="        iifname \"$a\" oifname \"$b\" accept$nl"
             ipt4+="-A GRETUN-FWD -i $a -o $b -m comment --comment gretun -j ACCEPT$nl"
@@ -1437,7 +1455,7 @@ routes_sync() {
     have_=$(rules_current | sort -u)
     while IFS='|' read -r p from iif tbl; do
         [[ -n "$p" ]] || continue
-        grep -qxF -- "$p|$from|$iif|$tbl" <<<"$want" || run ip -6 rule del pref "$p" 2>/dev/null || true
+        grep -qxF -- "$p|$from|$iif|$tbl" <<<"$want" || run ip -6 rule del pref "$p" from "$from" iif "$iif" lookup "$tbl" 2>/dev/null || true
     done <<<"$have_"
     while IFS='|' read -r p from iif tbl; do
         [[ -n "$p" ]] || continue
@@ -1550,6 +1568,9 @@ After=network-online.target
 
 [Service]
 Type=oneshot
+# A node restarted by a rollback inside heal must keep running after heal ends.
+KillMode=process
+TimeoutStartSec=10min
 ExecStart=$INSTALL_PATH heal" && changed=1
         write_file "$SYSTEMD_DIR/gretun-heal.timer" 644 "$MARK
 [Unit]
@@ -1616,7 +1637,7 @@ alert() {  # alert "message": ntfy, if configured
     curl -fsS -m 10 "${h[@]}" -d "$1" "$url" >/dev/null 2>&1
 }
 watchdog() {
-    local n f fails st
+    local n f fails st recreated=0
     for n in $(tun_list); do
         tun_load "$n" || continue
         f="$RUNDIR/wd-$n"
@@ -1633,6 +1654,7 @@ watchdog() {
         if (( fails == 3 || fails % 10 == 0 )); then
             warn "Tunnel $n: no reply from ${C[IN4_PEER]} ($fails checks); recreating it."
             tunnel_ensure "$n" recreate || true
+            recreated=1
         fi
         if (( fails == 3 )); then
             st=down
@@ -1641,6 +1663,9 @@ watchdog() {
         printf '%s %s\n' "$fails" "$st" >"$f"
     done
     C=()
+    # Deleting the link dropped its routes (PasarGuard table, exit return
+    # routes): put them back now instead of a minute later.
+    if (( recreated )); then routes_sync || true; fi
 }
 
 # ---------------------------------------------------------------- commands
@@ -1718,7 +1743,9 @@ create_tunnel() {
     done
     tun_save
     ufw_gre allow "${C[REMOTE]}"
-    if ! sync_all; then
+    # Another tunnel's problem must not undo this one: only the new one is judged.
+    sync_all || true
+    if (( ! DRY )) && ! iface_exists "$n"; then
         warn "The tunnel could not be brought up; removing it again."
         remove_file "$TUN_DIR/$n.conf"
         sync_all quiet || true
@@ -1770,6 +1797,7 @@ tunnel_add_foreign() {
     local name="${C[NAME]}"
     tunnel_summary || return 0
     create_tunnel || return 1
+    (( DRY )) && return 0
     print_key "$name"
     next_steps "Copy the key above and paste it on the Iran server." \
         "Then, on the Iran server: 2) Port forwarding or 3) PasarGuard node."
@@ -1800,6 +1828,7 @@ tunnel_add_iran_key() {
     key_decode "$1" || die "This connection key is not valid (copy it again, completely)."
     local_has_addr "$K_IRAN" || warn "The key says this server is $K_IRAN, but that address is not configured here."
     if [[ -f "$TUN_DIR/${O_NAME:-x}.conf" ]]; then die "Tunnel $O_NAME already exists."; fi
+    if [[ -n "$O_NAME" ]]; then valid_name "$O_NAME" || die "Invalid tunnel name: $O_NAME (letters, digits, _; at most 15)."; fi
     C=([NAME]="${O_NAME:-$(next_tun_name)}" [FAMILY]="$K_FAMILY" [ROLE]=iran [LOCAL]="$(norm_ip "$K_IRAN")"
         [REMOTE]="$(norm_ip "$K_FOREIGN")" [MTU]="$K_MTU" [ORIGIN]=gretun)
     fill_inner iran "$K_NET"
@@ -1821,6 +1850,7 @@ tunnel_add_iran_manual() {
         warn "Use the form 10.X.Y.0/30."
     done
     C=([NAME]="${O_NAME:-$(next_tun_name)}" [FAMILY]="$fam" [ROLE]=iran [LOCAL]="$local_" [REMOTE]="$peer" [ORIGIN]=gretun)
+    valid_name "${C[NAME]}" || die "Invalid tunnel name: ${C[NAME]} (letters, digits, _; at most 15)."
     C[MTU]=$(ask_mtu "$fam") || exit 1
     fill_inner iran "$net"
     tunnel_add_iran_finish
@@ -1888,11 +1918,17 @@ cmd_tunnel_remove() {
         (( FORCE )) || die "Remove those first, or use --force."
     fi
     confirm "Remove tunnel $n?" N || return 0
-    if (( ! TEST_MODE )); then run systemctl disable "gretun@$n.service" >/dev/null 2>&1 || true; fi
+    rb_begin "remove tunnel $n"
+    if (( ! TEST_MODE )); then
+        run systemctl disable "gretun@$n.service" >/dev/null 2>&1 || true
+        rb_undo systemctl enable "gretun@$n.service"
+    fi
     remove_file "$TUN_DIR/$n.conf"
     ufw_gre delete "$remote"
-    sync_all
+    rb_undo ufw_gre allow "$remote"
+    sync_all || true
     ok "Tunnel $n removed."
+    rb_arm 180
 }
 cmd_tunnel_key() {
     local n="${ARGS[0]:-}"
@@ -2207,12 +2243,13 @@ cmd_import_legacy() {
             rb_save_file "$HAPROXY_CFG"
             rb_after systemctl reload-or-restart haproxy
         fi
+        # On rollback ours must release the ports before the old unit starts again.
+        rb_after systemctl disable --now "$UDP_UNIT.service"
         # The old UDP unit holds the ports: stop it right before ours starts.
         if (( ! TEST_MODE )) && unit_exists haproxy-forwarder-udp.service; then
             run systemctl disable --now haproxy-forwarder-udp.service >/dev/null 2>&1 || true
             rb_after systemctl enable --now haproxy-forwarder-udp.service
         fi
-        rb_after systemctl disable --now "$UDP_UNIT.service"
         fwd_apply || warn "Forwarder rules could not be applied; see: gretun fwd status"
     fi
     tunnel_status
@@ -2753,7 +2790,11 @@ cmd_fwd_add() {
                 has_opt "$opts" "$i" || continue
                 if port_listening "$i" "$l"; then
                     own=$(port_owner "$i" "$l")
-                    [[ "$own" == haproxy || "$own" == nginx ]] || die "Port $l/$i is already used by ${own:-another program}."
+                    # TCP ports may only be held by HAProxy, UDP ports by gretun's nginx.
+                    local mine=0
+                    if [[ "$i" == tcp && "$own" == haproxy ]]; then mine=1; fi
+                    if [[ "$i" == udp && "$own" == nginx ]] && svc_active "$UDP_UNIT"; then mine=1; fi
+                    (( mine )) || die "Port $l/$i is already used by ${own:-another program}."
                 fi
             done
         fi
@@ -2923,7 +2964,14 @@ cmd_fwd_rebuild() {
 fwd_heal() {
     fwd_load
     (( ${#F_LISTEN[@]} )) || return 0
-    have haproxy || (( ! $(fwd_count tcp) )) || { warn "heal: haproxy is not installed."; return 0; }
+    if ! have haproxy && (( $(fwd_count tcp) )); then
+        # Said once, not every minute.
+        if [[ ! -f "$RUNDIR/warned-no-haproxy" ]]; then
+            warn "heal: haproxy is not installed, the TCP forward rules cannot work."
+            (( DRY )) || : >"$RUNDIR/warned-no-haproxy"
+        fi
+        return 0
+    fi
     local tmp need=0 stamp="$RUNDIR/fwd-heal-failed"
     # Compare the generated text only; validation (haproxy -c, nginx -t) runs
     # only when something has to be re-applied, not every minute.
@@ -2977,11 +3025,11 @@ cmd_fwd_uninstall() {
     if nft list table inet "$NFT_FWD" >/dev/null 2>&1; then run nft delete table inet "$NFT_FWD"; fi
     if (( PURGE )); then
         if [[ -f "$ETC/.installed-nginx" ]]; then
-            run env DEBIAN_FRONTEND=noninteractive apt-get purge -y -q nginx nginx-common libnginx-mod-stream || true
+            run timeout 600 env DEBIAN_FRONTEND=noninteractive apt-get purge -y -q "${APT_OPTS[@]}" nginx nginx-common libnginx-mod-stream </dev/null 9>&- || true
             remove_file "$ETC/.installed-nginx"
         fi
         if [[ -f "$ETC/.installed-haproxy" ]]; then
-            run env DEBIAN_FRONTEND=noninteractive apt-get purge -y -q haproxy || true
+            run timeout 600 env DEBIAN_FRONTEND=noninteractive apt-get purge -y -q "${APT_OPTS[@]}" haproxy </dev/null 9>&- || true
             remove_file "$ETC/.installed-haproxy"
         fi
     fi
@@ -3021,21 +3069,26 @@ env_set() {
         mode == "replace" && $0 ~ act { if (!done) { print k "=" v; done = 1 } else print "# " $0 "  # duplicate, disabled by gretun"; next }
         { print }
         mode == "after" && !done && $0 ~ com { print k "=" v; done = 1 }
-        END { if (mode == "append") { print k "=" v } }' "$f" >"$tmp"
+        END { if (mode == "append") { print k "=" v } }' "$f" >"$tmp" && [[ -s "$tmp" ]] \
+        || { rm -f "$tmp"; die "Could not write $f (disk full?); it was not changed."; }
     if [[ "$mode" == append ]] && ! grep -q '^# gretun: PasarGuard WireGuard via GRE' "$f"; then
         # Put a header above the first appended key.
         awk -v k="$k" 'BEGIN { act = "^" k "=" } $0 ~ act && !h { print ""; print "# gretun: PasarGuard WireGuard via GRE"; h = 1 } { print }' \
             "$tmp" >"$tmp.2" && mv -f "$tmp.2" "$tmp"
     fi
-    cat "$tmp" >"$f"   # keeps owner and mode of the original
+    # cat keeps owner and mode of the original.
+    cat "$tmp" >"$f" || { rm -f "$tmp"; die "Could not write $f (disk full?)."; }
     rm -f "$tmp"
 }
 env_unset() {  # removes active KEY= lines
     (( DRY )) && { printf '%s[dry-run]%s %s: remove %s\n' "$DIM" "$NC" "$1" "$2"; return 0; }
     local tmp
     tmp=$(mktemp)
-    grep -vE "^[[:space:]]*$2[[:space:]]*=" "$1" >"$tmp" || true
-    cat "$tmp" >"$1"
+    local rc=0
+    grep -vE "^[[:space:]]*$2[[:space:]]*=" "$1" >"$tmp" || rc=$?
+    # grep: 1 = nothing left (fine), 2 = error (the file must stay as it is).
+    (( rc <= 1 )) || { rm -f "$tmp"; die "Could not edit $1; it was not changed."; }
+    cat "$tmp" >"$1" || { rm -f "$tmp"; die "Could not write $1 (disk full?)."; }
     rm -f "$tmp"
 }
 env_backup() {  # env_backup NODE FILE
@@ -3069,14 +3122,14 @@ pg_detect() {
         if have "$name"; then cli=$(command -v "$name"); elif [[ -x "$R/usr/local/bin/$name" ]]; then cli="$R/usr/local/bin/$name"; fi
         cont=""
         if have docker; then
-            cont=$(docker ps --format '{{.Names}}|{{.Label "com.docker.compose.project.working_dir"}}' 2>/dev/null \
+            cont=$(timeout 15 docker ps --format '{{.Names}}|{{.Label "com.docker.compose.project.working_dir"}}' 2>/dev/null \
                 | awk -F'|' -v d="$d" '$2 == d {print $1; exit}' || true)
         fi
         printf '%s|%s|%s|%s\n' "$name" "$d" "$cli" "$cont"
         seen+="$d "
     done
     if have docker; then
-        docker ps --format '{{.Names}}|{{.Image}}|{{.Label "com.docker.compose.project.working_dir"}}' 2>/dev/null \
+        timeout 15 docker ps --format '{{.Names}}|{{.Image}}|{{.Label "com.docker.compose.project.working_dir"}}' 2>/dev/null \
             | awk -F'|' 'tolower($2) ~ /pasarguard\/node/' | while IFS='|' read -r cont _ d; do
                 [[ -n "$d" && "$seen" != *" $d "* && -f "$d/.env" ]] || continue
                 printf '%s|%s||%s\n' "${d##*/}" "$d" "$cont"
@@ -3162,7 +3215,7 @@ pg_node_log() {  # pg_node_log NODE CONTAINER
     local unit
     cat "$(pg_log "$1")" 2>/dev/null || true
     if unit=$(pg_unit "$1"); then journalctl -u "$unit" --since "-10min" --no-pager 2>/dev/null || true; fi
-    if [[ -n "$2" ]] && have docker; then docker logs --tail 500 "$2" 2>&1 || true; fi
+    if [[ -n "$2" ]] && have docker; then timeout 15 docker logs --tail 500 "$2" 2>&1 </dev/null || true; fi
 }
 
 # ---------------------------------------------------------------- exit key
@@ -3387,7 +3440,7 @@ cmd_pg_setup() {
         done
         iface_exists "$wg" || warn "$wg does not exist right now (fine if the node creates it later)."
     fi
-    pref=$(alloc_pref "$name")
+    pref=$(alloc_pref "$name") || exit 1
 
     section "PasarGuard node $name via $tun"
     cat <<EOF
@@ -3914,7 +3967,11 @@ traffic_update() {
             <<<"${row[$i]:-$i|||0|0|$day|0|0|$mon|0|0|0|0}"
         if ifx=$(iface_index "$i"); then
             read -r rx tx < <(iface_bytes "$i")
-            if [[ "$f_ifx" == "$ifx" && "$f_boot" == "$boot" ]] && (( rx >= lrx && tx >= ltx )); then
+            if [[ -z "${row[$i]:-}" ]]; then
+                # First time this interface is seen: only remember where it stands now
+                # (its lifetime counters are not "today").
+                inc_rx=0 inc_tx=0
+            elif [[ "$f_ifx" == "$ifx" && "$f_boot" == "$boot" ]] && (( rx >= lrx && tx >= ltx )); then
                 inc_rx=$((rx - lrx)) inc_tx=$((tx - ltx))
             else
                 # New interface, recreated tunnel or reboot: its counters started at 0.
@@ -3975,7 +4032,7 @@ cmd_traffic() {
         if (( ${#days_[@]} > 1 )); then
             local max=0 v
             for line in "${days_[@]}"; do v="${line#*|}"; (( v > max )) && max=$v; done
-            printf '  %slast %s days%s\n' "$DIM" "${#days_[@]}" "$NC"
+            printf '  %slast %s days with traffic%s\n' "$DIM" "${#days_[@]}" "$NC"
             for line in "${days_[@]}"; do
                 v="${line#*|}" k="${line%%|*}"
                 printf '    %s %s %s\n' "${k:5}" "$(bar 16 "$v" "$max")" "$(fmt_bytes "$v")"
@@ -4440,6 +4497,12 @@ cmd_heal() {
     if (( ! DRY )) && rb_pending && [[ -f "$RB_PENDING/deadline" ]] \
         && (( $(cat "$RB_PENDING/deadline" 2>/dev/null || echo 0) <= $(date +%s) )); then
         warn "A change was not confirmed before its deadline (reboot?); rolling it back."
+        rb_fire
+        return 0
+    fi
+    if (( ! DRY )) && rb_pending && [[ ! -f "$RB_PENDING/deadline" ]] \
+        && [[ -n "$(find "$RB_PENDING" -maxdepth 0 -mmin +30 2>/dev/null)" ]]; then
+        warn "A change was left half-way without a safety timer; rolling it back."
         rb_fire
         return 0
     fi
