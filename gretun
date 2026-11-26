@@ -119,7 +119,17 @@ warn() { printf '%s[!!]%s %s\n' "$YELLOW" "$NC" "$*" >&2; jlog "warning: $*"; }
 err()  { printf '%s[XX]%s %s\n' "$RED" "$NC" "$*" >&2; jlog "error: $*"; }
 die()  { err "$*"; exit 1; }
 hint() { printf '     %s-> %s%s\n' "$DIM" "$*" "$NC"; }
-section() { printf '\n%s== %s ==%s\n' "$BOLD" "$*" "$NC"; }
+# section "Title": a bold title followed by a dim rule, e.g. "Tunnels ──────"
+section() {
+    local w l
+    w=$(term_cols)
+    (( w > 64 )) && w=64
+    w=$((w - ${#1} - 2))
+    (( w < 3 )) && w=3
+    printf -v l '%*s' "$w" ''
+    if (( UTF )); then l="${l// /─}"; else l="${l// /-}"; fi
+    printf '\n%s%s%s %s%s%s\n' "$BOLD" "$*" "$NC" "$DIM" "$l" "$NC"
+}
 quiet() { "$@" >/dev/null 2>&1; }
 have() { command -v "$1" >/dev/null 2>&1; }
 os_field() { awk -F= -v k="$1" '$1 == k { gsub(/"/, "", $2); print $2 }' /etc/os-release 2>/dev/null || true; }
@@ -227,6 +237,8 @@ cpad() {
     while [[ "$t" =~ $re ]]; do t="${t/"${BASH_REMATCH[0]}"/}"; done
     printf '%s%*s' "$1" "$(( $2 > ${#t} ? $2 - ${#t} : 0 ))" ''
 }
+# rpad TEXT WIDTH: TEXT right-aligned in WIDTH columns (no colour codes in TEXT)
+rpad() { printf '%*s%s' "$(( $2 > ${#1} ? $2 - ${#1} : 0 ))" '' "$1"; }
 # narrow WIDTH: output goes to a terminal narrower than WIDTH, so wide tables
 # are printed as short blocks instead (piped output keeps the table).
 narrow() { [[ -t 1 ]] && (( $(term_cols) < $1 )); }
@@ -262,6 +274,34 @@ spark() {
 }
 arrow_in() { if (( UTF )); then printf '↓'; else printf 'in'; fi; }
 arrow_out() { if (( UTF )); then printf '↑'; else printf 'out'; fi; }
+# sdot ok|warn|bad: a coloured state mark. The shape differs too, so it still
+# reads without colour: ● ◐ ○ (ASCII: + ~ x).
+sdot() {
+    case "$1" in
+        ok) if (( UTF )); then printf '%s●%s' "$GREEN" "$NC"; else printf '%s+%s' "$GREEN" "$NC"; fi ;;
+        warn) if (( UTF )); then printf '%s◐%s' "$YELLOW" "$NC"; else printf '%s~%s' "$YELLOW" "$NC"; fi ;;
+        *) if (( UTF )); then printf '%s○%s' "$RED" "$NC"; else printf '%sx%s' "$RED" "$NC"; fi ;;
+    esac
+}
+# paint ok|warn|bad TEXT: TEXT in the colour of that state
+paint() {
+    case "$1" in ok) printf '%s%s%s' "$GREEN" "$2" "$NC" ;; warn) printf '%s%s%s' "$YELLOW" "$2" "$NC" ;;
+        *) printf '%s%s%s' "$RED" "$2" "$NC" ;; esac
+}
+# kv "Label" VALUE [WIDTH]: one aligned "Label:  value" line of a summary block
+kv() { printf '  %-*s %s\n' "${3:-16}" "$1:" "$2"; }
+# attn TEXT FIX: one line of the dashboard's attention area. The fix (a menu
+# path) goes on the same line when it fits, else on the next one.
+attn() {
+    local cols mark
+    cols=$(term_cols)
+    if (( UTF )); then mark='▲'; else mark='!!'; fi
+    if (( ${#mark} + 1 + ${#1} + 4 + ${#2} <= cols )); then
+        printf '%s%s%s %s  %s-> %s%s\n' "$YELLOW$BOLD" "$mark" "$NC" "$1" "$DIM" "$2" "$NC"
+    else
+        printf '%s%s%s %s\n%*s%s-> %s%s\n' "$YELLOW$BOLD" "$mark" "$NC" "$1" "$(( ${#mark} + 1 ))" '' "$DIM" "$2" "$NC"
+    fi
+}
 # The next steps after an action: "next_steps line..."
 next_steps() {
     local l w
@@ -740,8 +780,12 @@ rb_arm() {  # rb_arm DEFAULT_SECONDS [CHECKS_FAILED]: restarts the timer, then a
         local end left
         end=$(( $(date +%s) + secs ))
         printf 'Check that everything works (SSH, clients, the other server).\n'
-        printf '  %syes%s   = keep it\n  %sno%s    = undo it now\n  %slater%s = decide later (run %sgretun confirm%s or %sgretun rollback%s before the timer ends)\n' \
-            "$BOLD" "$NC" "$BOLD" "$NC" "$BOLD" "$NC" "$BOLD" "$NC" "$BOLD" "$NC"
+        printf '  %s%-6s%s keep it\n  %s%-6s%s undo it now\n' "$BOLD" yes "$NC" "$BOLD" no "$NC"
+        if (( IN_MENU )); then
+            printf '  %s%-6s%s decide later: 7) Tools > 5 keep, 6 undo\n' "$BOLD" later "$NC"
+        else
+            printf '  %s%-6s%s decide later: gretun confirm / gretun rollback\n' "$BOLD" later "$NC"
+        fi
         while :; do
             left=$(( end - $(date +%s) ))
             if (( left <= 0 )); then a=""; break; fi
@@ -759,7 +803,8 @@ rb_arm() {  # rb_arm DEFAULT_SECONDS [CHECKS_FAILED]: restarts the timer, then a
                 y|yes) rb_confirm; return 0 ;;
                 n|no) warn "Undoing the change now..."; rb_fire; return 0 ;;
                 l|later)
-                    info "The safety timer keeps running. Confirm with: gretun confirm"
+                    if (( IN_MENU )); then info "The safety timer keeps running. Keep it: 7) Tools > 5"
+                    else info "The safety timer keeps running. Confirm with: gretun confirm"; fi
                     return 0 ;;
                 *) warn "Type yes, no or later." ;;
             esac
@@ -1103,7 +1148,7 @@ iface_bytes() {  # prints "<rx> <tx>"
         "$(cat "/sys/class/net/$1/statistics/tx_bytes" 2>/dev/null || echo 0)"
 }
 tunnel_status() {  # tunnel_status [NAME]
-    local n rx tx st v4 v6
+    local n rx tx st v4 v6 sk
     local -a names=()
     if [[ -n "${1:-}" ]]; then names=("$1"); else mapfile -t names < <(tun_list); fi
     if (( ${#names[@]} == 0 )); then info "No tunnels yet."; return 0; fi
@@ -1112,11 +1157,11 @@ tunnel_status() {  # tunnel_status [NAME]
     (( short )) || printf '%s%-10s %-7s %-8s %-4s %-30s %-16s %-16s %s%s\n' "$BOLD" NAME ROLE STATE FAM "LOCAL -> REMOTE" "PING v4" "PING v6" "RX / TX" "$NC"
     for n in "${names[@]}"; do
         tun_load "$n" || { warn "Unknown tunnel: $n"; continue; }
-        st="${RED}missing${NC}" v4="-" v6="-" rx=0 tx=0
+        st="${RED}missing${NC}" v4="-" v6="-" rx=0 tx=0 sk=bad
         if iface_exists "$n"; then
             link_info "$n"
-            if (( LI_UP )); then st="${GREEN}up${NC}"; else st="${YELLOW}down${NC}"; fi
-            if ping_peer "${C[IN4_PEER]}"; then v4="${PING_RTT}ms ${PING_LOSS}%"; else v4="${RED}no reply${NC}"; fi
+            if (( LI_UP )); then st="${GREEN}up${NC}" sk=ok; else st="${YELLOW}down${NC}" sk=warn; fi
+            if ping_peer "${C[IN4_PEER]}"; then v4="${PING_RTT}ms ${PING_LOSS}%"; else v4="${RED}no reply${NC}" sk=warn; fi
             if [[ -n "${C[IN6_PEER]:-}" ]]; then
                 if ping_peer "${C[IN6_PEER]}"; then v6="${PING_RTT}ms ${PING_LOSS}%"; else v6="${RED}no reply${NC}"; fi
             fi
@@ -1125,12 +1170,17 @@ tunnel_status() {  # tunnel_status [NAME]
         if (( short )); then
             # The same facts as the table, as a block that fits a phone screen.
             (( short++ > 1 )) && printf '\n'
-            printf '%s%s%s  %s side  %s  IPv%s transport\n' "$BOLD" "$n" "$NC" "${C[ROLE]}" "$st" "${C[FAMILY]}"
-            printf '  %-8s%s -> %s\n' public "${C[LOCAL]}" "${C[REMOTE]}"
-            printf '  %-8sv4 %s   v6 %s\n' ping "$v4" "$v6"
-            printf '  %-8s%s <-> %s\n' inner "${C[IN4_LOCAL]}" "${C[IN4_PEER]}"
-            if [[ -n "${C[IN6_LOCAL]:-}" ]]; then printf '  %-8s%s <-> %s\n' "" "${C[IN6_LOCAL]}" "${C[IN6_PEER]:--}"; fi
-            printf '  %-8s%s   rx %s / tx %s\n' mtu "${C[MTU]}" "$(fmt_bytes "$rx")" "$(fmt_bytes "$tx")"
+            local side="${C[ROLE]:-?} side"
+            [[ "${C[ROLE]:-}" == iran ]] && side="Iran side"
+            printf '%s %s%s%s  %s  %s%s, IPv%s (%s)%s\n' "$(sdot "$sk")" "$BOLD" "$n" "$NC" "$st" "$DIM" "$side" "${C[FAMILY]}" \
+                "$( [[ ${C[FAMILY]} == 6 ]] && echo ip6gre || echo gre )" "$NC"
+            printf '  %-9s%s -> %s\n' public "${C[LOCAL]}" "${C[REMOTE]}"
+            printf '  %-9sv4 %s' ping "${v4/ms/ ms}"
+            if [[ -n "${C[IN6_PEER]:-}" ]]; then printf '   v6 %s' "${v6/ms/ ms}"; fi
+            printf '\n  %-9s%s <-> %s\n' inner "${C[IN4_LOCAL]}" "${C[IN4_PEER]}"
+            if [[ -n "${C[IN6_LOCAL]:-}" ]]; then printf '  %-9s%s <-> %s\n' "" "${C[IN6_LOCAL]}" "${C[IN6_PEER]:--}"; fi
+            printf '  %-9s%s\n' mtu "${C[MTU]}"
+            printf '  %-9s%s %s   %s %s\n' traffic "$(arrow_in)" "$(fmt_bytes "$rx")" "$(arrow_out)" "$(fmt_bytes "$tx")"
             continue
         fi
         printf '%-10s %-7s %s %-4s %-30s %s %s %s / %s\n' "$n" "${C[ROLE]}" "$(cpad "$st" 8)" "v${C[FAMILY]}" \
@@ -1819,7 +1869,7 @@ tunnel_summary() {
   This server:     ${C[LOCAL]}
   $(printf '%-17s' "$other server:")${C[REMOTE]}
   Tunnel network:  $(cidr_norm "${C[IN4_LOCAL]}/${C[IN4_PREFIX]}")
-  Inner addresses: here ${C[IN4_LOCAL]}, other side ${C[IN4_PEER]}
+  Inner addresses: ${C[IN4_LOCAL]} here, ${C[IN4_PEER]} there
   MTU:             ${C[MTU]}
 EOF
     confirm "Create the tunnel?" Y || { info "Nothing was created."; return 1; }
@@ -1901,7 +1951,12 @@ pick_tunnel() {  # pick_tunnel VAR [role]
     C=()
     (( ${#__names[@]} )) || die "No ${2:+$2-side }tunnel exists yet. Create one first: gretun > 1) GRE tunnel"
     if [[ -n "$O_TUNNEL" ]]; then printf -v "$1" '%s' "$O_TUNNEL"; return 0; fi
-    if (( ${#__names[@]} == 1 )); then printf -v "$1" '%s' "${__names[0]}"; return 0; fi
+    if (( ${#__names[@]} == 1 )); then
+        # Only one fits: no question, but say which one is used.
+        if (( IN_MENU )); then info "Using tunnel ${__names[0]} (${__labels[0]#*|}), the only one."; fi
+        printf -v "$1" '%s' "${__names[0]}"
+        return 0
+    fi
     choose __c "Which tunnel?" "${__labels[@]}"
     (( __c > 0 )) || exit 0
     printf -v "$1" '%s' "${__names[__c - 1]}"
@@ -1914,8 +1969,8 @@ cmd_tunnel_remove() {
     used=$(tunnel_used_by "$n")
     if [[ -n "$used" ]]; then
         warn "Tunnel $n is used by:"
-        printf '       %s\n' "$used"
-        (( FORCE )) || die "Remove those first, or use --force."
+        printf '       %s\n' "${used//$'\n'/$'\n       '}"
+        (( FORCE )) || die "Remove those first, or force it: gretun tunnel remove $n --force"
     fi
     confirm "Remove tunnel $n?" N || return 0
     rb_begin "remove tunnel $n"
@@ -2719,6 +2774,7 @@ ask_dest() {  # ask_dest VAR: the foreign inner IP of an Iran-side tunnel
         [[ " ${__ips[*]} " == *" $__d "* ]] || die "$__d is not the foreign end of a tunnel here. Tunnels: ${__ips[*]}"
     elif (( ${#__ips[@]} == 1 )); then
         __d="${__ips[0]}"
+        if (( IN_MENU )); then info "Through tunnel ${__list[0]%%|*} to $__d (the only Iran-side tunnel)."; fi
     else
         (( HAVE_TTY && ! ASSUME_YES )) || die "Several tunnels: choose one with --dest (${__ips[*]}) or: gretun tunnel forward NAME"
         choose __c "Through which tunnel?" "${__list[@]}"
@@ -2868,17 +2924,17 @@ cmd_fwd_remove() {
     ok "Removed:$removed"
 }
 cmd_fwd_status() {
-    local i p proto st tot_in=0 tot_out=0 conns b_in b_out reach
+    local i p proto st tot_in=0 tot_out=0 conns b_in b_out reach sk
     local -A cnt=()
     fwd_load
     section "Forwarder"
     if (( $(fwd_count tcp) )); then
-        if svc_active haproxy; then st="${GREEN}running${NC}"; else st="${RED}stopped${NC}"; fi
-        printf '  haproxy (TCP):     %s\n' "$st"
+        if svc_active haproxy; then st="$(sdot ok) haproxy running"; else st="$(sdot bad) $(paint bad "haproxy stopped")"; fi
+        kv "TCP" "$st" 5
     fi
     if (( $(fwd_count udp) )); then
-        if svc_active "$UDP_UNIT"; then st="${GREEN}running${NC}"; else st="${RED}stopped${NC}"; fi
-        printf '  %s (UDP):  %s\n' "$UDP_UNIT" "$st"
+        if svc_active "$UDP_UNIT"; then st="$(sdot ok) $UDP_UNIT running"; else st="$(sdot bad) $(paint bad "$UDP_UNIT stopped")"; fi
+        kv "UDP" "$st" 5
     fi
     (( ${#F_LISTEN[@]} )) || { info "No forwarding rules."; return 0; }
     while read -r p b_in; do cnt[$p]="$b_in"; done < <(read_counters)
@@ -2890,11 +2946,12 @@ cmd_fwd_status() {
         p="${F_LISTEN[i]}"
         for proto in tcp udp; do
             has_opt "${F_OPTS[i]}" "$proto" || continue
-            if port_listening "$proto" "$p"; then st="${GREEN}yes${NC}"; else st="${RED}no${NC}"; fi
+            sk=ok
+            if port_listening "$proto" "$p"; then st="${GREEN}yes${NC}"; else st="${RED}no${NC}" sk=bad; fi
             if [[ "$proto" == tcp ]]; then
                 conns=$(ss -Htn state established "( sport = :$p )" 2>/dev/null | wc -l)
                 if timeout 3 bash -c "exec 3<>/dev/tcp/${F_IP[i]}/${F_DPORT[i]}" 2>/dev/null; then reach="${GREEN}ok${NC}"
-                else reach="${RED}unreachable${NC}"; fi
+                else reach="${RED}unreachable${NC}" sk=bad; fi
             else
                 conns=$(ss -Hun state established "( dport = :${F_DPORT[i]} )" 2>/dev/null | wc -l)
                 reach="-"
@@ -2902,24 +2959,32 @@ cmd_fwd_status() {
             b_in="${cnt[${proto:0:1}${p}i]:-0}" b_out="${cnt[${proto:0:1}${p}o]:-0}"
             tot_in=$((tot_in + b_in)) tot_out=$((tot_out + b_out))
             if (( short )); then
-                printf '%s%s/%s%s -> %s   listening %s   dest %s\n' "$BOLD" "$p" "$proto" "$NC" \
-                    "$(host_port "${F_IP[i]}" "${F_DPORT[i]}")" "$st" "$reach"
-                printf '  connections %s   in %s   out %s\n' "$conns" "$(fmt_bytes "$b_in")" "$(fmt_bytes "$b_out")"
+                # Two lines per port: where it goes and how much, then its health.
+                printf '%s %s%-9s%s %-16s %s %9s  %s %9s\n' "$(sdot "$sk")" "$BOLD" "$p/$proto" "$NC" \
+                    "$(host_port "${F_IP[i]}" "${F_DPORT[i]}")" "$(arrow_in)" "$(fmt_bytes "$b_in")" "$(arrow_out)" "$(fmt_bytes "$b_out")"
+                printf '    listening %s   dest %s   connections %s\n' "$st" "$reach" "${conns// /}"
                 continue
             fi
             printf '%-7s %-5s %-44s %s %-6s %-11s %-11s %s\n' "$p" "$proto" \
                 "$(host_port "${F_IP[i]}" "${F_DPORT[i]}")" "$(cpad "$st" 7)" "$conns" "$(fmt_bytes "$b_in")" "$(fmt_bytes "$b_out")" "$reach"
         done
     done
-    printf '\nTotal since the counters were created: in %s, out %s\n' "$(fmt_bytes "$tot_in")" "$(fmt_bytes "$tot_out")"
+    printf '\n%sAll ports%s  %s %s  %s %s\n%s(counted since the counters were created)%s\n' "$BOLD" "$NC" "$(arrow_in)" "$(fmt_bytes "$tot_in")" \
+        "$(arrow_out)" "$(fmt_bytes "$tot_out")" "$DIM" "$NC"
 }
 cmd_fwd_monitor() {
-    local iv="${O_INTERVAL:-2}" prev_t now dt k
+    local iv="${O_INTERVAL:-2}" prev_t now dt k fr l el="" ti to
     local -A prev=() cur=()
     [[ "$iv" =~ ^[0-9]+$ ]] && (( iv >= 1 )) || iv=2
     fwd_load
     (( ${#F_LISTEN[@]} )) || die "There are no rules to monitor."
     nft list table inet "$NFT_FWD" >/dev/null 2>&1 || counters_update
+    if [[ -t 1 ]]; then
+        # Each frame overwrites the last one in place (no clear, no flicker).
+        el=$'\033[K'
+        printf '\033[?25l\033[H\033[2J'
+        trap 'printf "\033[?25h"' EXIT
+    fi
     trap 'printf "\n"; exit 0' INT
     prev_t=$(date +%s.%N)
     while read -r k dt; do prev[$k]="$dt"; done < <(read_counters)
@@ -2929,9 +2994,12 @@ cmd_fwd_monitor() {
         cur=()
         while read -r k dt; do cur[$k]="$dt"; done < <(read_counters)
         dt=$(awk -v a="$now" -v b="$prev_t" 'BEGIN {print a - b}')
-        if [[ -t 1 ]]; then printf '\033[H\033[2J'; fi
-        printf '%sgretun live monitor%s  (every %ss, Ctrl+C to stop)   %s\n\n' "$BOLD" "$NC" "$iv" "$(date '+%H:%M:%S')"
-        printf '%s%-7s %-5s %-14s %-14s %s%s\n' "$BOLD" PORT PROTO "IN (users->)" "OUT (->users)" CONNS "$NC"
+        printf -v fr '%sgretun ports live%s  %s   %severy %ss, Ctrl+C stops%s\n' "$BOLD" "$NC" "$(date '+%H:%M:%S')" "$DIM" "$iv" "$NC"
+        fr+="$(hrule)"$'\n'
+        # IN = from the users, OUT = back to them; rates right-aligned.
+        printf -v l '%s%-6s %-5s %13s %13s %6s%s\n' "$BOLD" PORT PROTO "IN (users->)" "OUT (->users)" CONNS "$NC"
+        fr+="$l"
+        ti=0 to=0
         local i p proto ci co
         for i in $(fwd_sorted); do
             p="${F_LISTEN[i]}"
@@ -2940,10 +3008,16 @@ cmd_fwd_monitor() {
                 k="${proto:0:1}$p"
                 ci=$(( ${cur[${k}i]:-0} - ${prev[${k}i]:-0} ))
                 co=$(( ${cur[${k}o]:-0} - ${prev[${k}o]:-0} ))
-                printf '%-7s %-5s %-14s %-14s %s\n' "$p" "$proto" "$(fmt_rate "$ci" "$dt")" "$(fmt_rate "$co" "$dt")" \
+                ti=$((ti + ci)) to=$((to + co))
+                printf -v l '%-6s %-5s %13s %13s %6s\n' "$p" "$proto" "$(fmt_rate "$ci" "$dt")" "$(fmt_rate "$co" "$dt")" \
                     "$( [[ $proto == tcp ]] && ss -Htn state established "( sport = :$p )" 2>/dev/null | wc -l || echo -)"
+                fr+="$l"
             done
         done
+        printf -v l '%s%-12s %13s %13s%s\n' "$DIM" "all ports" "$(fmt_rate "$ti" "$dt")" "$(fmt_rate "$to" "$dt")" "$NC"
+        fr+="$l"
+        # One write per frame; every line clears what is left of the old one.
+        if [[ -t 1 ]]; then printf '\033[H%s\033[J' "${fr//$'\n'/$el$'\n'}"; else printf '%s' "$fr"; fi
         prev_t="$now"
         prev=()
         for k in "${!cur[@]}"; do prev[$k]="${cur[$k]}"; done
@@ -3615,19 +3689,11 @@ cmd_pg_key() {
 }
 cmd_pg_remove() {
     local name="${ARGS[0]:-$O_NODE}" f k v env
-    if [[ -z "$name" ]]; then
-        local -a l=()
-        for f in "$PG_DIR"/*.conf; do l+=("$(basename "$f" .conf)"); done
-        (( ${#l[@]} )) || die "No PasarGuard setup to remove."
-        local c
-        choose c "Remove which node setup?" "${l[@]}"
-        (( c > 0 )) || return 0
-        name="${l[c - 1]}"
-    fi
+    if [[ -z "$name" ]]; then pick_conf name "$PG_DIR" "Remove which node setup?" "No PasarGuard setup to remove."; fi
     f="$PG_DIR/$name.conf"
     conf_load "$f" || die "No gretun setup for node $name."
     env=$(cget ENV_FILE)
-    confirm "Undo the gretun settings of node $name (its .env keys go back to their old values)?" N || return 0
+    confirm "Undo the setup of node $name (.env keys back to old values)?" N || return 0
     local dir cli cont wg
     dir=$(cget NODE_DIR) cli=$(cget CLI) cont=$(cget CONTAINER) wg=$(cget WG_IF wg0)
     rb_begin "remove PasarGuard $name"
@@ -3647,12 +3713,16 @@ cmd_pg_remove() {
 
 # pg edit: change the WireGuard interface, subnets, table or tunnel of a node
 # setup; applied through the normal setup (same checks, restart, rollback).
-pick_conf() {  # pick_conf VAR DIR "title": one of DIR/*.conf (by name)
+pick_conf() {  # pick_conf VAR DIR "title" ["message when there is none"]: one of DIR/*.conf (by name)
     local __pc_f __pc_c
     local -a __pc_l=()
     for __pc_f in "$2"/*.conf; do __pc_l+=("$(basename "$__pc_f" .conf)"); done
-    (( ${#__pc_l[@]} )) || die "Nothing set up yet."
-    if (( ${#__pc_l[@]} == 1 )); then printf -v "$1" '%s' "${__pc_l[0]}"; return 0; fi
+    (( ${#__pc_l[@]} )) || die "${4:-Nothing set up yet.}"
+    if (( ${#__pc_l[@]} == 1 )); then
+        if (( IN_MENU )); then info "Using ${__pc_l[0]}, the only one here."; fi
+        printf -v "$1" '%s' "${__pc_l[0]}"
+        return 0
+    fi
     choose __pc_c "$3" "${__pc_l[@]}"
     (( __pc_c > 0 )) || exit 0
     printf -v "$1" '%s' "${__pc_l[__pc_c - 1]}"
@@ -3833,15 +3903,7 @@ cmd_exit_list() {
 }
 cmd_exit_remove() {
     local t="${ARGS[0]:-$O_TUNNEL}"
-    if [[ -z "$t" ]]; then
-        local -a l=()
-        local f c
-        for f in "$EXIT_DIR"/*.conf; do l+=("$(basename "$f" .conf)"); done
-        (( ${#l[@]} )) || die "No exits configured."
-        choose c "Remove which exit?" "${l[@]}"
-        (( c > 0 )) || return 0
-        t="${l[c - 1]}"
-    fi
+    if [[ -z "$t" ]]; then pick_conf t "$EXIT_DIR" "Remove which exit?" "No exits configured."; fi
     [[ -f "$EXIT_DIR/$t.conf" ]] || die "No exit for $t."
     confirm "Remove the exit (NAT and routes) for $t?" N || return 0
     rb_begin "remove exit $t"
@@ -4010,18 +4072,26 @@ traffic_sum() {
         only == "" || index(tf, " " $1 " ") { s += $a + $b } END { printf "%.0f", s }' <<<"$1"
 }
 cmd_traffic() {
-    local rows i line d drx dtx m mrx mtx arx atx k
+    local rows i line d drx dtx m mrx mtx arx atx k ntun=0 lin=in lout=out
+    local tdi=0 tdo=0 tmi=0 tmo=0 tai=0 tao=0
     local -a days_=()
     rows=$(traffic_update 1)
     [[ -n "$rows" ]] || { info "No tunnel or WireGuard interface to count yet."; return 0; }
+    if (( UTF )); then lin="$(arrow_in) in" lout="$(arrow_out) out"; fi
     section "Traffic"
-    printf '%sin = received by this server, out = sent by it. Counted every minute.%s\n' "$DIM" "$NC"
+    printf '%s%s = received by this server, %s = sent by it.%s\n' "$DIM" "$lin" "$lout" "$NC"
     while IFS='|' read -r i _ _ _ _ d drx dtx m mrx mtx arx atx; do
         [[ -n "$i" ]] || continue
+        if [[ -f "$TUN_DIR/$i.conf" ]]; then
+            ntun=$((ntun + 1))
+            tdi=$((tdi + drx)) tdo=$((tdo + dtx)) tmi=$((tmi + mrx)) tmo=$((tmo + mtx)) tai=$((tai + arx)) tao=$((tao + atx))
+        fi
         printf '\n%s%s%s  %s%s%s\n' "$BOLD" "$i" "$NC" "$DIM" "$(traffic_kind "$i")" "$NC"
-        printf '  %-8s %s %-11s %s %-11s %s\n' "today" "$(arrow_in)" "$(fmt_bytes "$drx")" "$(arrow_out)" "$(fmt_bytes "$dtx")" "= $(fmt_bytes $((drx + dtx)))"
-        printf '  %-8s %s %-11s %s %-11s %s\n' "$m" "$(arrow_in)" "$(fmt_bytes "$mrx")" "$(arrow_out)" "$(fmt_bytes "$mtx")" "= $(fmt_bytes $((mrx + mtx)))"
-        printf '  %-8s %s %-11s %s %-11s %s\n' "total" "$(arrow_in)" "$(fmt_bytes "$arx")" "$(arrow_out)" "$(fmt_bytes "$atx")" "= $(fmt_bytes $((arx + atx)))"
+        # Sizes are right-aligned, so the units line up.
+        printf '%s  %-9s %s %s %10s%s\n' "$DIM" "" "$(rpad "$lin" 10)" "$(rpad "$lout" 10)" "total" "$NC"
+        printf '  %-9s %10s %10s %10s\n' "today" "$(fmt_bytes "$drx")" "$(fmt_bytes "$dtx")" "$(fmt_bytes $((drx + dtx)))"
+        printf '  %-9s %10s %10s %10s\n' "$m" "$(fmt_bytes "$mrx")" "$(fmt_bytes "$mtx")" "$(fmt_bytes $((mrx + mtx)))"
+        printf '  %-9s %10s %10s %10s\n' "all time" "$(fmt_bytes "$arx")" "$(fmt_bytes "$atx")" "$(fmt_bytes $((arx + atx)))"
         # The last 7 days (today included) as bars.
         days_=()
         if [[ -f "$TRAFFIC_DAYS" ]]; then
@@ -4035,14 +4105,21 @@ cmd_traffic() {
             printf '  %slast %s days with traffic%s\n' "$DIM" "${#days_[@]}" "$NC"
             for line in "${days_[@]}"; do
                 v="${line#*|}" k="${line%%|*}"
-                printf '    %s %s %s\n' "${k:5}" "$(bar 16 "$v" "$max")" "$(fmt_bytes "$v")"
+                printf '    %s  %s %9s\n' "${k:5}" "$(bar 20 "$v" "$max")" "$(fmt_bytes "$v")"
             done
         fi
     done <<<"$rows"
-    printf '\n%sLive speed: gretun traffic live   (menu: 4) Traffic > 2)%s\n' "$DIM" "$NC"
+    if (( ntun > 1 )); then
+        printf '\n%sAll tunnels%s\n' "$BOLD" "$NC"
+        printf '  %-9s %10s %10s %10s\n' "today" "$(fmt_bytes "$tdi")" "$(fmt_bytes "$tdo")" "$(fmt_bytes $((tdi + tdo)))"
+        printf '  %-9s %10s %10s %10s\n' "$(date +%Y-%m)" "$(fmt_bytes "$tmi")" "$(fmt_bytes "$tmo")" "$(fmt_bytes $((tmi + tmo)))"
+        printf '  %-9s %10s %10s %10s\n' "all time" "$(fmt_bytes "$tai")" "$(fmt_bytes "$tao")" "$(fmt_bytes $((tai + tao)))"
+    fi
+    if (( IN_MENU )); then printf '\n%sCounted every minute. Live speed: 4) Traffic > 2)%s\n' "$DIM" "$NC"
+    else printf '\n%sCounted every minute. Live speed: gretun traffic live%s\n' "$DIM" "$NC"; fi
 }
 cmd_traffic_live() {
-    local iv="${O_INTERVAL:-1}" cols w n i now prev_t dt rin rout peak line
+    local iv="${O_INTERVAL:-1}" cols w sw n i now prev_t dt rin rout peak line fr l el="" tin tout ntun
     local -a ifs=()
     local -A prx=() ptx=() hist=() pk=() sesrx=() sestx=()
     [[ "$iv" =~ ^[0-9]+$ ]] && (( iv >= 1 )) || iv=1
@@ -4050,7 +4127,12 @@ cmd_traffic_live() {
     for i in "${ifs[@]}"; do iface_exists "$i" || continue; n=1; done
     (( ${n:-0} )) || die "No tunnel or WireGuard interface is up."
     exec 9>&-
-    if [[ -t 1 ]]; then printf '\033[?25l'; trap 'printf "\033[?25h"' EXIT; fi
+    if [[ -t 1 ]]; then
+        # Each frame overwrites the last one in place (no clear, no flicker).
+        el=$'\033[K'
+        printf '\033[?25l\033[H\033[2J'
+        trap 'printf "\033[?25h"' EXIT
+    fi
     trap 'printf "\n"; exit 0' INT TERM
     for i in "${ifs[@]}"; do
         hist[$i]="" pk[$i]=0 sesrx[$i]=0 sestx[$i]=0 prx[$i]="" ptx[$i]=""
@@ -4063,14 +4145,18 @@ cmd_traffic_live() {
         dt=$(awk -v a="$now" -v b="$prev_t" 'BEGIN { print (a - b > 0 ? a - b : 1) }')
         prev_t="$now"
         cols=$(term_cols)
-        w=$((cols - 34)); (( w > 30 )) && w=30; (( w < 8 )) && w=8
-        if [[ -t 1 ]]; then printf '\033[H\033[2J'; fi
-        printf '%sgretun live traffic%s  %s   %severy %ss, Ctrl+C stops%s\n' "$BOLD" "$NC" "$(date +%H:%M:%S)" "$DIM" "$iv" "$NC"
-        hrule
+        # "  ↓   " + bar + " " + rate (12): the bar takes the rest, 8-30 wide.
+        w=$((cols - 21)); (( w > 30 )) && w=30; (( w < 8 )) && w=8
+        # The sparkline and "  peak 999.99 Mbit/s" share one line.
+        sw=$((cols - 25)); (( sw > 40 )) && sw=40; (( sw < 8 )) && sw=8
+        fr="" tin=0 tout=0 ntun=0
+        printf -v l '%sgretun live traffic%s  %s   %severy %ss, Ctrl+C stops%s' "$BOLD" "$NC" "$(date +%H:%M:%S)" "$DIM" "$iv" "$NC"
+        fr+="$l"$'\n'"$(hrule)"$'\n'
         for i in "${ifs[@]}"; do
             local rx tx
             if ! iface_exists "$i"; then
-                printf '%s%s%s  %s%s%s\n\n' "$BOLD" "$i" "$NC" "$RED" "down" "$NC"
+                printf -v l '%s%s%s  %s %s' "$BOLD" "$i" "$NC" "$(sdot bad)" "$(paint bad down)"
+                fr+="$l"$'\n\n'
                 prx[$i]="" ptx[$i]=""
                 continue
             fi
@@ -4084,63 +4170,108 @@ cmd_traffic_live() {
             # Rates in bit/s; the bars use the highest rate seen (at least 1 Mbit/s).
             rin=$(awk -v b="$rin" -v t="$dt" 'BEGIN { printf "%.0f", b * 8 / t }')
             rout=$(awk -v b="$rout" -v t="$dt" 'BEGIN { printf "%.0f", b * 8 / t }')
+            if [[ -f "$TUN_DIR/$i.conf" ]]; then tin=$((tin + rin)) tout=$((tout + rout)) ntun=$((ntun + 1)); fi
             (( rin > pk[$i] )) && pk[$i]=$rin
             (( rout > pk[$i] )) && pk[$i]=$rout
             peak=${pk[$i]}; (( peak < 1000000 )) && peak=1000000
             hist[$i]="${hist[$i]} $((rin + rout))"
             read -r -a line <<<"${hist[$i]}"
-            (( ${#line[@]} > w + 10 )) && line=("${line[@]: -$((w + 10))}") && hist[$i]=" ${line[*]}"
-            printf '%s%s%s  %s%s%s\n' "$BOLD" "$i" "$NC" "$DIM" "$(traffic_kind "$i")" "$NC"
-            printf '  %-3s %s %s\n' "$(arrow_in)" "$(bar "$w" "$rin" "$peak")" "$(fmt_rate "$((rin / 8))" 1)"
-            printf '  %-3s %s %s\n' "$(arrow_out)" "$(bar "$w" "$rout" "$peak")" "$(fmt_rate "$((rout / 8))" 1)"
+            (( ${#line[@]} > sw )) && line=("${line[@]: -$sw}") && hist[$i]=" ${line[*]}"
+            printf -v l '%s%s%s  %s%s%s' "$BOLD" "$i" "$NC" "$DIM" "$(traffic_kind "$i")" "$NC"
+            fr+="$l"$'\n'
+            printf -v l '  %-3s %s %12s' "$(arrow_in)" "$(bar "$w" "$rin" "$peak")" "$(fmt_rate "$((rin / 8))" 1)"
+            fr+="$l"$'\n'
+            printf -v l '  %-3s %s %12s' "$(arrow_out)" "$(bar "$w" "$rout" "$peak")" "$(fmt_rate "$((rout / 8))" 1)"
+            fr+="$l"$'\n'
             local mx=0 v
             for v in "${line[@]}"; do (( v > mx )) && mx=$v; done
-            printf '  %s%s%s  %speak %s%s\n' "$GREEN" "$(spark "$mx" "${line[@]}")" "$NC" "$DIM" "$(fmt_rate "$((pk[$i] / 8))" 1)" "$NC"
-            printf '  %sthis view: %s %s  %s %s%s\n\n' "$DIM" "$(arrow_in)" "$(fmt_bytes "${sesrx[$i]}")" "$(arrow_out)" "$(fmt_bytes "${sestx[$i]}")" "$NC"
+            printf -v l '  %s%s%s  %speak %s%s' "$GREEN" "$(spark "$mx" "${line[@]}")" "$NC" "$DIM" "$(fmt_rate "$((pk[$i] / 8))" 1)" "$NC"
+            fr+="$l"$'\n'
+            printf -v l '  %sthis view: %s %s  %s %s%s' "$DIM" "$(arrow_in)" "$(fmt_bytes "${sesrx[$i]}")" "$(arrow_out)" "$(fmt_bytes "${sestx[$i]}")" "$NC"
+            fr+="$l"$'\n\n'
         done
+        if (( ntun > 1 )); then
+            printf -v l '%sAll tunnels%s  %s %s   %s %s' "$BOLD" "$NC" "$(arrow_in)" "$(fmt_rate "$((tin / 8))" 1)" \
+                "$(arrow_out)" "$(fmt_rate "$((tout / 8))" 1)"
+            fr+="$l"$'\n'
+        fi
+        # One write per frame; every line clears what is left of the old one.
+        if [[ -t 1 ]]; then printf '\033[H%s\033[J' "${fr//$'\n'/$el$'\n'}"; else printf '%s' "$fr"; fi
     done
 }
 cmd_status() {
+    local f any=0 tcp udp
+    menu_state
+    section "Server"
+    kv Name "$(hostname 2>/dev/null || echo '?')" 9
+    kv Role "$(server_role)" 9
+    f=$(detect_local 4); if [[ -n "$f" ]]; then kv IPv4 "$f" 9; fi
+    f=$(detect_local 6); if [[ -n "$f" ]]; then kv IPv6 "$f" 9; fi
     section "Tunnels"
     tunnel_status
     fwd_load
     if (( ${#F_LISTEN[@]} )); then
         section "Port forwarding"
+        tcp=$(fwd_count tcp) udp=$(fwd_count udp)
+        if (( tcp )); then
+            if svc_active haproxy; then kv "TCP" "$(sdot ok) haproxy running" 9
+            else kv "TCP" "$(sdot bad) $(paint bad "haproxy stopped")" 9; fi
+        fi
+        if (( udp )); then
+            if svc_active "$UDP_UNIT"; then kv "UDP" "$(sdot ok) $UDP_UNIT running" 9
+            else kv "UDP" "$(sdot bad) $(paint bad "$UDP_UNIT stopped")" 9; fi
+        fi
+        printf '\n'
         cmd_fwd_list
     fi
-    local f any=0
     for f in "$PG_DIR"/*.conf; do
-        (( any )) || section "PasarGuard (Iran side)"
+        (( any )) || section "PasarGuard node (Iran side)"
         any=1
-        printf '  node %s via %s, table %s, clients %s %s\n' "$(conf_val "$f" NODE)" "$(conf_val "$f" TUNNEL)" \
-            "$(conf_val "$f" TABLE)" "$(conf_val "$f" V4_SUBNETS)" "$(conf_val "$f" V6_SUBNETS)"
+        printf '  %s%s%s\n' "$BOLD" "$(conf_val "$f" NODE)" "$NC"
+        kv "  via" "$(conf_val "$f" TUNNEL), WireGuard $(conf_val "$f" WG_IF wg0)" 10
+        kv "  table" "$(conf_val "$f" TABLE)" 10
+        kv "  clients" "$(conf_val "$f" V4_SUBNETS) $(conf_val "$f" V6_SUBNETS)" 10
     done
     any=0
     for f in "$EXIT_DIR"/*.conf; do
         (( any )) || section "Exit (foreign side)"
         any=1
-        printf '  via %s for %s %s\n' "$(conf_val "$f" TUNNEL)" "$(conf_val "$f" V4_SUBNETS)" "$(conf_val "$f" V6_SUBNETS)"
+        printf '  %svia %s%s\n' "$BOLD" "$(conf_val "$f" TUNNEL)" "$NC"
+        kv "  clients" "$(conf_val "$f" V4_SUBNETS) $(conf_val "$f" V6_SUBNETS)" 10
+        kv "  wan" "$(conf_val "$f" WAN4 auto) / $(conf_val "$f" WAN6 auto)" 10
     done
     if rb_pending; then
-        local left=$(( $(cat "$RB_PENDING/deadline" 2>/dev/null || date +%s) - $(date +%s) ))
-        warn "Waiting for confirmation: $(cat "$RB_PENDING/label") (rollback in ${left}s)."
-        hint "Keep it: gretun confirm    Undo it now: gretun rollback"
+        printf '\n'
+        warn "Waiting for OK: $(cat "$RB_PENDING/label") ($(rb_left) left)."
+        if (( IN_MENU )); then hint "Keep it: 7) Tools > 5    Undo it now: 7) Tools > 6"
+        else hint "Keep it: gretun confirm    Undo it now: gretun rollback"; fi
     fi
 }
 
-dr_ok() { printf '  %s[ok]%s %s\n' "$GREEN" "$NC" "$*"; }
-dr_bad() { printf '  %s[!!]%s %s\n' "$YELLOW" "$NC" "$*"; DR_ISSUES=$((DR_ISSUES + 1)); }
-dr_info() { printf '  %s[--]%s %s\n' "$DIM" "$NC" "$*"; }
+# Doctor lines: [ok] fine, [!!] a problem (counted, listed again at the end),
+# [--] information. Long lines wrap under the text, not under the tag.
 DR_ISSUES=0
+DR_LIST=()
+dr_line() {  # dr_line COLOUR TAG TEXT
+    local w
+    w=$(term_cols)
+    (( w > 100 )) && w=100
+    printf '%s\n' "$3" | fold -s -w "$((w - 8))" | sed -e 's/ *$//' \
+        -e "1s/^/  $1$2$NC /" -e '2,$s/^/       /'
+}
+dr_ok() { dr_line "$GREEN" "[ok]" "$*"; }
+dr_bad() { dr_line "$YELLOW" "[!!]" "$*"; DR_ISSUES=$((DR_ISSUES + 1)); DR_LIST+=("$*"); }
+dr_info() { dr_line "$DIM" "[--]" "$*"; }
 cmd_doctor() {
     local n t w v out wgs
-    DR_ISSUES=0
+    DR_ISSUES=0 DR_LIST=()
     section "System"
     dr_info "gretun $VERSION, $(os_field PRETTY_NAME), kernel $(uname -r)"
     if legacy_present; then dr_bad "haproxy-forwarder is still installed"; hint "Import it: gretun tunnel import legacy"; fi
     if (( ! TEST_MODE )) && svc_enabled nftables.service; then
         dr_bad "nftables.service is enabled: restarting it runs /etc/nftables.conf, which usually flushes ALL rules"
-        hint "gretun never needs it. The heal timer restores gretun's rules within a minute if that happens."
+        hint "gretun never needs it. If that happens, the heal timer"
+        hint "restores gretun's rules within a minute."
     fi
     if rb_pending; then dr_bad "A change waits for confirmation: $(cat "$RB_PENDING/label")"; hint "gretun confirm   or   gretun rollback"; fi
 
@@ -4150,7 +4281,8 @@ cmd_doctor() {
         tun_load "$n" || continue
         if ! iface_exists "$n"; then
             dr_bad "$n: interface missing"
-            hint "gretun heal (or systemctl restart gretun@$n). For ip6gre: modprobe ip6_gre must work."
+            hint "gretun heal   (or: systemctl restart gretun@$n)"
+            hint "For ip6gre, 'modprobe ip6_gre' must work."
             continue
         fi
         link_info "$n"
@@ -4164,14 +4296,16 @@ cmd_doctor() {
             dr_ok "$n: ping ${C[IN4_PEER]} ${PING_RTT} ms, ${PING_LOSS}% loss"
             if ! ping -n -q -c 1 -W 2 -M "do" -s $((C[MTU] - 28)) "${C[IN4_PEER]}" >/dev/null 2>&1; then
                 dr_bad "$n: full-size packets (MTU ${C[MTU]}) do not pass"
-                hint "Lower the MTU: remove and re-create the tunnel with --mtu $((C[MTU] - 40)) on both sides."
+                hint "Lower the MTU on both sides, e.g.:"
+                hint "gretun tunnel edit $n --mtu $((C[MTU] - 40))"
             else
                 dr_ok "$n: full-size packets pass (MTU ${C[MTU]})"
             fi
         else
             dr_bad "$n: no reply from ${C[IN4_PEER]}"
             hint "Is the tunnel set up on the other server (gretun tunnel list there)?"
-            hint "Does the provider block GRE (protocol 47)? Is the other server's address still ${C[REMOTE]}?"
+            hint "Does the provider block GRE (protocol 47)?"
+            hint "Is the other server's address still ${C[REMOTE]}?"
         fi
         if [[ -n "${C[IN6_PEER]:-}" ]]; then
             if ping_peer "${C[IN6_PEER]}" 3; then dr_ok "$n: IPv6 ping ${C[IN6_PEER]} ${PING_RTT} ms"
@@ -4194,8 +4328,9 @@ cmd_doctor() {
     out=$(nft list ruleset 2>/dev/null | awk '/^table/ {tb = $2 " " $3} /policy drop/ && tb !~ /gretun/ && tb !~ /^(ip|ip6) (filter|nat|mangle|raw)$/ {print tb}' | sort -u)
     if [[ -n "$out" ]]; then
         dr_bad "native nftables chains with 'policy drop' outside gretun: $(paste -sd, <<<"$out")"
-        hint "An accept in gretun's table cannot override a drop elsewhere. Add 'meta l4proto 47 accept' and"
-        hint "'iifname \"gre*\" accept' to that table's input chain yourself."
+        hint "An accept in gretun's table cannot override a drop elsewhere."
+        hint "Add these to that table's input chain yourself:"
+        hint "meta l4proto 47 accept   and   iifname \"gre*\" accept"
     fi
     if nft list table ip "${NFT_T}_nat" >/dev/null 2>&1 || nft list table ip6 "${NFT_T}_nat" >/dev/null 2>&1; then
         dr_ok "NAT: $(nft list table ip "${NFT_T}_nat" 2>/dev/null | grep -c masquerade) IPv4 + $(nft list table ip6 "${NFT_T}_nat" 2>/dev/null | grep -c masquerade) IPv6 masquerade rules"
@@ -4203,9 +4338,9 @@ cmd_doctor() {
 
     section "Routing"
     out=$(ip -4 rule show | grep -vE '^(0|32766|32767):' || true)
-    [[ -n "$out" ]] && printf '%s\n' "$out" | sed 's/^/       ip rule     /'
+    [[ -n "$out" ]] && printf '%s\n' "$out" | sed -e "s/^/       ${DIM}ip rule     /" -e "s/\$/${NC}/"
     out=$(ip -6 rule show | grep -vE '^(0|32766|32767):' || true)
-    [[ -n "$out" ]] && printf '%s\n' "$out" | sed 's/^/       ip -6 rule  /'
+    [[ -n "$out" ]] && printf '%s\n' "$out" | sed -e "s/^/       ${DIM}ip -6 rule  /" -e "s/\$/${NC}/"
     local f tbl wgi real
     for f in "$PG_DIR"/*.conf; do
         tbl=$(conf_val "$f" TABLE) t=$(conf_val "$f" TUNNEL) wgi=$(conf_val "$f" WG_IF wg0)
@@ -4232,7 +4367,8 @@ cmd_doctor() {
         v=$(sysctl_get "net/ipv6/conf/$w/accept_ra")
         if [[ "$(sysctl_get net.ipv6.conf.all.forwarding)" == 1 && "$v" == 1 ]]; then
             dr_bad "$w: accept_ra=1 with forwarding on: RA-learned IPv6 will be lost"
-            hint "sysctl -w net.ipv6.conf.$w.accept_ra=2   (gretun heal does this when PasarGuard/exit is set up)"
+            hint "sysctl -w net.ipv6.conf.$w.accept_ra=2"
+            hint "(heal does this when PasarGuard or an exit is set up)"
         else
             dr_info "$w: accept_ra=$v"
         fi
@@ -4246,12 +4382,12 @@ cmd_doctor() {
         for w in $wgs; do
             if iface_exists "$w"; then
                 out=$(offload_state "$w")
-                [[ "$out" == *on* ]] && dr_bad "$w: offload $out" || dr_ok "$w: offload $out, mtu $(cat "/sys/class/net/$w/mtu")"
+                [[ "$out" == *on* ]] && dr_bad "$w: offload $out" || dr_ok "$w: offload $out, mtu $(cat "/sys/class/net/$w/mtu" 2>/dev/null || echo ?)"
             else
                 dr_info "$w: not present (the node creates it)"
             fi
         done
-        [[ -f "$UDEV_RULE" ]] && dr_ok "udev rule re-applies offload settings when $w is re-created"
+        [[ -f "$UDEV_RULE" ]] && dr_ok "udev rule re-applies offload settings when $(printf '%s' "$wgs" | paste -sd, -) is re-created"
     fi
 
     section "Services"
@@ -4265,8 +4401,17 @@ cmd_doctor() {
     if (( $(fwd_count tcp) )); then svc_active haproxy && dr_ok "haproxy running" || dr_bad "haproxy stopped"; fi
     if (( $(fwd_count udp) )); then svc_active "$UDP_UNIT" && dr_ok "$UDP_UNIT running" || dr_bad "$UDP_UNIT stopped"; fi
     C=()
-    printf '\n'
-    if (( DR_ISSUES == 0 )); then ok "No problems found."; else warn "$DR_ISSUES item(s) need attention (see the hints above)."; fi
+    section "Result"
+    if (( DR_ISSUES == 0 )); then ok "No problems found."; return 0; fi
+    warn "$DR_ISSUES item(s) need attention (the hints are above):"
+    # One short line each: the details are in the sections above.
+    w=$(term_cols)
+    for out in "${DR_LIST[@]}"; do
+        (( ${#out} > w - 5 )) && out="${out:0:$((w - 8))}..."
+        printf '   - %s\n' "$out"
+    done
+    if (( IN_MENU )); then hint "Many of them are fixed by: 7) Tools > 7) Repair now"
+    else hint "Many of them are fixed by: gretun heal"; fi
 }
 
 cmd_bench() {
@@ -4554,24 +4699,25 @@ rb_left() {  # time left on the safety timer, e.g. "2m 05s"
 }
 pending_notice() {
     rb_pending || return 0
-    printf '%s!! Waiting for confirmation:%s %s (%s left)\n' "$YELLOW$BOLD" "$NC" \
-        "$(cat "$RB_PENDING/label" 2>/dev/null)" "$(rb_left)"
-    printf '   Keep it: 7) Tools > 5     Undo it: 7) Tools > 6\n'
+    attn "Waiting for OK: $(cat "$RB_PENDING/label" 2>/dev/null), $(rb_left) left" "7) Tools > 5 keep, 6 undo"
 }
-# banner: a short dashboard at the top of the main menu
+# banner: a short dashboard at the top of the main menu. One label column,
+# one line per tunnel, then an attention area with the menu path of each fix.
 banner() {
-    local n w=4 cols v4 v6 to st col rtt tmp lab=Tunnels f
-    local -a names=()
+    local n w=4 cols v4 v6 st dot rtt tmp f rows lab=Tunnels sep=", " rest
+    local -a names=() attns=()
+    local -A today=()
     clear 2>/dev/null || true
     menu_state
     cols=$(term_cols)
+    if (( UTF )); then sep=" · "; fi
     if (( cols >= 64 )); then
         printf '%sgretun %s%s   %sGRE tunnels, port forwarding, PasarGuard exit%s\n' "$BOLD" "$VERSION" "$NC" "$DIM" "$NC"
     else
         printf '%sgretun %s%s\n' "$BOLD" "$VERSION" "$NC"
     fi
     hrule
-    printf '%-9s%s, %s\n' Server "$(hostname 2>/dev/null || echo '?')" "$(server_role)"
+    printf '%-9s%s%s%s\n' Server "$(hostname 2>/dev/null || echo '?')" "$sep" "$(server_role)"
     v4=$(detect_local 4) v6=$(detect_local 6)
     if [[ -n "$v4" && -n "$v6" ]] && (( 9 + ${#v4} + 3 + ${#v6} <= cols )); then
         printf '%-9s%s   %s\n' IP "$v4" "$v6"
@@ -4580,6 +4726,12 @@ banner() {
         if [[ -n "$v6" ]]; then printf '%-9s%s\n' IPv6 "$v6"; fi
     fi
     mapfile -t names < <(tun_list)
+    if (( ST_TUN )); then
+        rows=$(traffic_update 0 2>/dev/null || true)
+        while IFS='|' read -r n _ _ _ _ _ v4 v6 _; do
+            [[ -n "$n" ]] && today[$n]=$(( v4 + v6 ))
+        done <<<"$rows"
+    fi
     if (( ${#names[@]} == 0 )); then
         printf '%-9s%s\n' Tunnels "none yet"
     else
@@ -4594,36 +4746,51 @@ banner() {
         done
         wait
         for n in "${names[@]}"; do
-            case "$(conf_val "$TUN_DIR/$n.conf" ROLE)" in iran) to="to foreign" ;; foreign) to="to Iran" ;; *) to="?" ;; esac
-            if [[ ! -e "$tmp/$n" ]]; then st=down col="$RED"
+            if [[ ! -e "$tmp/$n" ]]; then
+                st=down dot=bad
+                attns+=("$n is down|6) Doctor")
             elif [[ -s "$tmp/$n" ]]; then
                 rtt=$(<"$tmp/$n") rtt="${rtt%.*}"
-                if [[ "$rtt" == 0 ]]; then st="up <1 ms"; else st="up $rtt ms"; fi
-                col="$GREEN"
-            else st="no reply" col="$YELLOW"; fi
-            if (( UTF )); then st="● $st"; fi
-            f=$(conf_val "$TUN_DIR/$n.conf" REMOTE)
-            printf '%-9s%-*s  %-10s  ' "$lab" "$w" "$n" "$to"
-            if (( 9 + w + 2 + 10 + 2 + 13 + 1 + ${#f} <= cols )); then
-                # "● " is 4 bytes but 2 columns: pad by visible width.
-                printf '%s%s%s %s%s%s\n' "$col" "$(cpad "$st" 13)" "$NC" "$DIM" "$f" "$NC"
+                if [[ "$rtt" == 0 ]]; then st="<1 ms"; else st="$rtt ms"; fi
+                dot=ok
             else
-                printf '%s%s%s\n' "$col" "$st" "$NC"
+                st="no reply" dot=warn
+                attns+=("$n: no reply from the other side|6) Doctor")
             fi
+            # The far end: its role when this server has both kinds, else its address.
+            if (( ST_IRAN && ST_FOREIGN )); then
+                case "$(conf_val "$TUN_DIR/$n.conf" ROLE)" in iran) rest="to foreign" ;; foreign) rest="to Iran" ;; *) rest="" ;; esac
+            else
+                rest=$(conf_val "$TUN_DIR/$n.conf" REMOTE)
+            fi
+            printf '%-9s%s %-*s  %s' "$lab" "$(sdot "$dot")" "$w" "$n" "$(paint "$dot" "$(cpad "$st" 8)")"
+            if [[ -n "${today[$n]:-}" ]]; then printf '  today %8s' "$(fmt_bytes "${today[$n]}")"; fi
+            if [[ -n "$rest" ]] && (( 9 + 2 + w + 2 + 8 + 16 + 2 + ${#rest} <= cols )); then
+                printf '  %s%s%s' "$DIM" "$rest" "$NC"
+            fi
+            printf '\n'
             lab=""
         done
         rm -rf "$tmp"
-    fi
-    if (( ST_TUN )); then
-        local rows
-        rows=$(traffic_update 0 2>/dev/null || true)
         if [[ -n "$rows" ]]; then
             printf '%-9stoday %s%s%s   month %s%s%s\n' Traffic "$BOLD" "$(fmt_bytes "$(traffic_sum "$rows" 7 8 tunnels)")" "$NC" \
                 "$BOLD" "$(fmt_bytes "$(traffic_sum "$rows" 10 11 tunnels)")" "$NC"
         fi
     fi
     if (( ST_FWD )); then
-        printf '%-9s%s port(s): TCP %s, UDP %s\n' Forward "$ST_FWD" "$(fwd_count tcp)" "$(fwd_count udp)"
+        local tcp udp svcs="" kinds=""
+        tcp=$(fwd_count tcp) udp=$(fwd_count udp)
+        (( tcp )) && kinds="TCP $tcp"
+        (( udp )) && kinds+="${kinds:+, }UDP $udp"
+        if (( tcp )); then
+            if svc_active haproxy; then svcs+="  $(sdot ok) TCP"
+            else svcs+="  $(sdot bad) $(paint bad "TCP stopped")"; attns+=("TCP forwarder (haproxy) stopped|7) Tools > 7) Repair"); fi
+        fi
+        if (( udp )); then
+            if svc_active "$UDP_UNIT"; then svcs+="  $(sdot ok) UDP"
+            else svcs+="  $(sdot bad) $(paint bad "UDP stopped")"; attns+=("UDP forwarder stopped|7) Tools > 7) Repair"); fi
+        fi
+        printf '%-9s%s port%s (%s)%s\n' Forward "$ST_FWD" "$( (( ST_FWD == 1 )) || printf s)" "$kinds" "$svcs"
     fi
     for f in "$PG_DIR"/*.conf; do
         printf '%-9s%s via %s, WireGuard %s\n' "PG node" "$(conf_val "$f" NODE)" "$(conf_val "$f" TUNNEL)" "$(conf_val "$f" WG_IF wg0)"
@@ -4637,12 +4804,19 @@ banner() {
         printf '%sStart:%s on the foreign server choose 1) GRE tunnel > 1),\n' "$BOLD" "$NC"
         printf '       then paste its key on the Iran server: 1) > 2).\n'
     fi
+    # The pending change first: it has a deadline.
     pending_notice
+    for f in "${attns[@]}"; do attn "${f%%|*}" "${f#*|}"; done
+    if (( ST_TUN && ${#attns[@]} == 0 )) && ! rb_pending; then
+        printf '%s %sEverything is up.%s\n' "$(sdot ok)" "$GREEN" "$NC"
+    fi
 }
 menu_head() {  # a sub-menu starts on a clean screen with the context on top
+    local sep=" | "
+    if (( UTF )); then sep=" · "; fi
     clear 2>/dev/null || true
     menu_state
-    printf '%sgretun %s | %s%s\n' "$DIM" "$VERSION" "$(server_role)" "$NC"
+    printf '%sgretun %s%s%s%s%s%s\n' "$DIM" "$VERSION" "$sep" "$(hostname 2>/dev/null || echo '?')" "$sep" "$(server_role)" "$NC"
     pending_notice
 }
 # Pastes a connection key, again and again until it is valid; Enter cancels.
@@ -4661,6 +4835,7 @@ ask_conn_key() {  # ask_conn_key VAR
 # mi OK "Label" "hint" "reason": one menu item for choose; with OK=0 it is
 # shown with the reason and cannot be chosen.
 mi() { if (( $1 )); then printf '%s|%s' "$2" "$3"; else printf '~%s|%s' "$2" "$4"; fi; }
+tunnel_view() { section "Tunnels"; tunnel_status; }
 menu_tunnel() {
     local c k a
     while :; do
@@ -4685,7 +4860,7 @@ menu_tunnel() {
             1) O_ROLE=foreign; run_action cmd_tunnel_add; O_ROLE="" ;;
             2) if ask_conn_key k; then O_KEY="$k"; run_action cmd_tunnel_add; O_KEY=""; fi ;;
             3) O_ROLE=iran; run_action cmd_tunnel_add; O_ROLE="" ;;
-            4) run_action tunnel_status ;;
+            4) run_action tunnel_view ;;
             5) run_action cmd_tunnel_key ;;
             6) run_action cmd_tunnel_edit ;;
             7) run_action cmd_tunnel_forward ;;
@@ -4710,7 +4885,7 @@ menu_fwd() {
         inst=0
         if (( ST_FWD )) || [[ -f "$RULES" || -f "$UDP_CFG" ]]; then inst=1; fi
         if (( ST_FWD )); then
-            printf '\nRules: %s port(s), TCP %s, UDP %s\n' "$ST_FWD" "$(fwd_count tcp)" "$(fwd_count udp)"
+            printf '\n%-9s%s port%s (TCP %s, UDP %s)\n' Rules "$ST_FWD" "$( (( ST_FWD == 1 )) || printf s)" "$(fwd_count tcp)" "$(fwd_count udp)"
         elif (( ! ST_IRAN )); then
             printf '\n%sPorts are forwarded on the Iran server, through a tunnel.%s\n' "$DIM" "$NC"
         fi
