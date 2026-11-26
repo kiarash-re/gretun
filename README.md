@@ -114,9 +114,11 @@ The interface is not recreated, so there is no downtime. `gre.service` is disabl
 gretun
 ```
 
-The top of the menu is a short dashboard: which server this is (Iran / foreign), each tunnel
-with up/down and ping, forwarded ports, PasarGuard node or exit, and a notice when a change
-waits for confirmation. Items that cannot work on this server (for example "Forward ports"
+The top of the menu is a short dashboard: which server this is (Iran / foreign), one line per
+tunnel (state, ping and today's traffic), forwarded ports and whether their services run,
+PasarGuard node or exit. Below it, every problem gets one line with the menu path that fixes
+it: a change waiting for confirmation (with the time left), a tunnel that is down or does not
+answer, a stopped forwarder. Items that cannot work on this server (for example "Forward ports"
 without an Iran-side tunnel) are shown with the reason and cannot be chosen. After each action
 gretun prints **What to do next** (for example, on the foreign server: what to paste on the
 Iran server). Every prompt shows its default in `[brackets]`; a wrong value is asked again;
