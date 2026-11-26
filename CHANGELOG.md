@@ -1,5 +1,41 @@
 # Changelog
 
+## 1.7.0 — 2026-11-26
+
+Fixes from a second full review:
+
+- A rollback done by heal (an unconfirmed change after a reboot) no longer stops the PasarGuard
+  node it restarts (heal unit: KillMode=process). Heal is limited to 10 minutes per run.
+- A full disk can no longer leave the node's `.env` or gretun's own files empty: every write is
+  checked and the old file stays.
+- Traffic: an interface seen for the first time starts at 0 instead of adding its whole
+  lifetime to "today" (e.g. right after updating to 1.6.x).
+- When heal recreates a tunnel that stopped answering, its routes are put back at once (clients
+  had no internet for up to a minute).
+- If SSH drops during a change, gretun finishes it and writes its output to
+  /var/log/gretun/gretun.log (before, the change could stop half-way).
+- A problem in one tunnel no longer makes creating another tunnel fail. Removing a tunnel now has
+  the safety timer like other routing changes.
+- Firewall: new connections from the internet towards the clients behind a tunnel are now really
+  dropped (the rule only accepted replies, but nothing dropped the rest).
+- docker, apt purge and other slow commands are time-limited; ping is read in the C locale (a
+  translated ping made every tunnel look down); Unicode is used only when the system really has
+  a UTF-8 locale; tunnel names are checked on the Iran side too; "on [fixed]" offloads are no
+  longer retried every minute; "haproxy is not installed" is logged once; a port held by another
+  program on the other protocol is refused; a change left half-way without a timer is rolled
+  back after 30 minutes; several rollback-order details.
+- New `tests/unit-test.sh` (78 tests, no root or network needed).
+
+UI:
+
+- Dashboard: one line per tunnel with state, ping and today's traffic, forwarder service state,
+  and an attention area (pending change with time left, tunnel down, forwarder stopped) with the
+  menu path to fix it; "Everything is up" otherwise.
+- Status, Doctor and Traffic: section titles with a rule, aligned values, units lined up, totals
+  for all tunnels, a short "Result" summary in Doctor, phone-friendly blocks.
+- Live speed and the per-port monitor redraw without flicker and show an "all" line.
+- When only one tunnel, node or exit fits, gretun says which one it used instead of asking.
+
 ## 1.6.2 — 2026-11-23
 
 - Fix: adding a forwarded port looked frozen on servers without HAProxy. apt ran with all its
